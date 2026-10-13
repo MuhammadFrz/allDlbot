@@ -51,6 +51,7 @@ def deploy():
             "requirements.txt",
             "config.py",
             "bot.py",
+            "alldl_bot_session.session",
         ]
 
         for fname in files_to_upload:
