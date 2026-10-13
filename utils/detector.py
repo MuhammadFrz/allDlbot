@@ -9,6 +9,10 @@ PLATFORM_PATTERNS = {
     "tiktok": re.compile(r'(?:tiktok\.com/|vt\.tiktok\.com/|vm\.tiktok\.com/)', re.IGNORECASE),
     "twitter": re.compile(r'(?:(?:twitter\.com|x\.com)/[^/]+/status/|t\.co/)', re.IGNORECASE),
     "spotify": re.compile(r'(?:open\.spotify\.com/(?:track|album|playlist|artist|episode)/|spotify\.link/)', re.IGNORECASE),
+    "pinterest": re.compile(r'(?:(?:[a-z]{2}\.)?pinterest\.(?:com|co\.[a-z]{2}|[a-z]{2})/pin/|pin\.it/)', re.IGNORECASE),
+    "reddit": re.compile(r'(?:(?:(?:www|old|new)\.)?reddit\.com/(?:r/[^/]+/comments/|gallery/|user/[^/]+/comments/)|redd\.it/|v\.redd\.it/)', re.IGNORECASE),
+    "soundcloud": re.compile(r'(?:soundcloud\.com/[^/]+/(?:[^/]+|sets/[^/]+)|on\.soundcloud\.com/)', re.IGNORECASE),
+    "facebook": re.compile(r'(?:(?:www|m|web)\.)?(?:facebook\.com/(?:watch\?|reel/|reels/|.*[?&]v=|share/|videos/|story\.php|permalink\.php)|fb\.watch/|fb\.com/)', re.IGNORECASE),
 }
 
 def extract_url(text: str) -> Optional[str]:

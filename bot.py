@@ -25,6 +25,10 @@ from downloaders import (
     TikTokDownloader,
     TwitterDownloader,
     SpotifyDownloader,
+    PinterestDownloader,
+    RedditDownloader,
+    SoundCloudDownloader,
+    FacebookDownloader,
 )
 
 # Setup Logging
@@ -82,6 +86,14 @@ PLATFORM_INLINE_BUTTONS = [
     ],
     [
         Button.inline("📺 YouTube", data=b"plat:youtube"),
+        Button.inline("📌 Pinterest", data=b"plat:pinterest"),
+    ],
+    [
+        Button.inline("🤖 Reddit", data=b"plat:reddit"),
+        Button.inline("☁️ SoundCloud", data=b"plat:soundcloud"),
+    ],
+    [
+        Button.inline("📘 Facebook", data=b"plat:facebook"),
         Button.inline("🔄 Media Converter", data=b"plat:converter"),
     ],
 ]
@@ -98,6 +110,10 @@ async def start_handler(event):
         "• 🐦 **Twitter / X**: HD Videos, Animated GIFs, Multi-image tweets\n"
         "• 🎧 **Spotify**: 320kbps MP3 with album artwork & tags\n"
         "• 📺 **YouTube**: Videos, Shorts, Quality Selector (1080p, 720p, 480p, 360p) & MP3\n"
+        "• 📌 **Pinterest**: Original High-Res Images & HD Video Pins\n"
+        "• 🤖 **Reddit**: Videos with audio merged, Multi-Image Galleries, GIFs\n"
+        "• ☁️ **SoundCloud**: 320kbps MP3 with 500x500 Cover Art & Tags\n"
+        "• 📘 **Facebook**: High Quality Reels & Watch Videos\n"
         "• 🔄 **Media Converter**: Convert any video to MP3, GIF, or change resolution!\n\n"
         "👇 **Tap a platform below to learn more, or paste your link directly:**"
     )
@@ -115,7 +131,11 @@ async def download_menu_button(event):
         "• `instagram.com/...` (Reels, posts, carousels with all media)\n"
         "• `x.com/...` or `twitter.com/...` (Videos, GIFs, images)\n"
         "• `open.spotify.com/...` (Tracks, albums, playlists)\n"
-        "• `youtube.com/...` or `youtu.be/...` (Videos, Shorts, MP3)\n\n"
+        "• `youtube.com/...` or `youtu.be/...` (Videos, Shorts, MP3)\n"
+        "• `pinterest.com/...` or `pin.it/...` (Original photos & videos)\n"
+        "• `reddit.com/...` or `redd.it/...` (Videos with sound & galleries)\n"
+        "• `soundcloud.com/...` (320kbps MP3 with cover artwork)\n"
+        "• `facebook.com/...` or `fb.watch/...` (Reels & Watch videos)\n\n"
         "👇 **Paste your link here now:**"
     )
     await event.respond(text, buttons=MAIN_KEYBOARD, parse_mode="md")
@@ -202,6 +222,36 @@ async def platform_info_callback(event):
             "• **GIF Converter**: Turn short clips into GIFs.\n"
             "• Works with regular videos and YouTube Shorts.\n\n"
             "💡 *Paste any YouTube link to try it!*"
+        ),
+        "pinterest": (
+            "📌 **Pinterest Downloader**\n\n"
+            "• **Original Resolution Images**: Highest possible quality.\n"
+            "• **HD Video Pins**: Watermark-free MP4 videos.\n"
+            "• **GIFs & Idea Pins**: Full animated support.\n"
+            "• Supports `pinterest.com` & `pin.it` shortlinks.\n\n"
+            "💡 *Paste any Pinterest link to try it!*"
+        ),
+        "reddit": (
+            "🤖 **Reddit Downloader**\n\n"
+            "• **Videos With Audio**: Automatically merges video + sound with FFmpeg.\n"
+            "• **Galleries**: Downloads all photos in multi-image posts.\n"
+            "• **Native GIFs**: High-speed animated format.\n"
+            "• Supports `reddit.com`, `redd.it`, & `v.redd.it`.\n\n"
+            "💡 *Paste any Reddit link to try it!*"
+        ),
+        "soundcloud": (
+            "☁️ **SoundCloud Downloader**\n\n"
+            "• **High Quality Audio**: 320kbps MP3 extraction.\n"
+            "• **Cover Artwork**: 500x500 high-resolution album artwork embedded.\n"
+            "• **ID3 Tags**: Artist, title, and duration metadata embedded.\n\n"
+            "💡 *Paste any SoundCloud link to try it!*"
+        ),
+        "facebook": (
+            "📘 **Facebook Downloader**\n\n"
+            "• **Reels & Watch**: High definition video downloads.\n"
+            "• **Public Videos**: Direct streaming MP4 format.\n"
+            "• Supports `facebook.com` & `fb.watch` links.\n\n"
+            "💡 *Paste any Facebook link to try it!*"
         ),
         "converter": (
             "🔄 **Media Converter**\n\n"
@@ -322,6 +372,22 @@ async def message_handler(event):
     elif platform == "spotify":
         task_id = uuid.uuid4().hex[:8]
         t = asyncio.create_task(run_spotify_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "pinterest":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(run_pinterest_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "reddit":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(run_reddit_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "soundcloud":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(run_soundcloud_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "facebook":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(run_facebook_job(event, normalized_url, task_id))
         active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
 
 
@@ -722,6 +788,213 @@ async def run_spotify_job(event, url: str, task_id: str):
     except Exception as e:
         logger.error(f"Spotify error: {e}")
         await status_msg.edit(f"❌ **Error downloading Spotify track:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# Pinterest Job
+# -------------------------------------------------------------
+async def run_pinterest_job(event, url: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.reply(
+        "⏳ **Fetching Pinterest media (HD video / original image)...**",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            res = await PinterestDownloader.download(url, task_dir)
+            if not res.get("success") or not res.get("path"):
+                await status_msg.edit(f"❌ **{res.get('error', 'Could not download this Pinterest pin.')}**")
+                return
+
+            media_type = res.get("type", "image")
+            file_path = res["path"]
+            title = res.get("title", "Pinterest Pin")
+            caption = f"📌 **Pinterest**\n\n{title}".strip()
+
+            progress = TelegramProgress(status_msg, action="Uploading to Telegram", buttons=make_cancel_button(task_id))
+            if media_type == "video":
+                await client.send_file(
+                    event.chat_id,
+                    file_path,
+                    caption=caption,
+                    supports_streaming=True,
+                    progress_callback=progress.callback,
+                )
+            else:
+                await client.send_file(
+                    event.chat_id,
+                    file_path,
+                    caption=caption,
+                    progress_callback=progress.callback,
+                )
+
+            await status_msg.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"Pinterest job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Pinterest error: {e}")
+        await status_msg.edit(f"❌ **Error downloading Pinterest pin:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# Reddit Job
+# -------------------------------------------------------------
+async def run_reddit_job(event, url: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.reply(
+        "⏳ **Fetching Reddit media (with audio & galleries)...**",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            res = await RedditDownloader.download(url, task_dir)
+            if not res.get("success") or not res.get("media_items"):
+                await status_msg.edit(f"❌ **{res.get('error', 'Failed to retrieve Reddit media.')}**")
+                return
+
+            items = res["media_items"]
+            title = res.get("title", "")
+            author = res.get("author", "Reddit User")
+            caption = f"🤖 **Reddit (r/{author})**\n\n{title}".strip()
+
+            await status_msg.edit(f"📤 **Uploading {len(items)} Reddit media item(s)...**", buttons=make_cancel_button(task_id))
+
+            if len(items) == 1:
+                it = items[0]
+                progress = TelegramProgress(status_msg, action="Uploading", buttons=make_cancel_button(task_id))
+                await client.send_file(
+                    event.chat_id,
+                    it["path"],
+                    caption=caption,
+                    supports_streaming=(it.get("type") == "video"),
+                    progress_callback=progress.callback,
+                )
+            else:
+                paths = [it["path"] for it in items]
+                for i in range(0, len(paths), config.MAX_ALBUM_SIZE):
+                    chunk = paths[i:i + config.MAX_ALBUM_SIZE]
+                    c_text = caption if i == 0 else ""
+                    await client.send_file(event.chat_id, chunk, caption=c_text, album=True)
+
+            await status_msg.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"Reddit job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Reddit error: {e}")
+        await status_msg.edit(f"❌ **Error downloading Reddit media:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# SoundCloud Job
+# -------------------------------------------------------------
+async def run_soundcloud_job(event, url: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.reply(
+        "⏳ **Fetching SoundCloud audio (320kbps MP3 + cover art)...**",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            res = await SoundCloudDownloader.download(url, task_dir)
+            if not res.get("success") or not res.get("tracks"):
+                await status_msg.edit(f"❌ **{res.get('error', 'Failed to download SoundCloud audio.')}**")
+                return
+
+            tracks = res["tracks"]
+            await status_msg.edit(f"📤 **Uploading {len(tracks)} audio track(s)...**", buttons=make_cancel_button(task_id))
+
+            for t in tracks:
+                track_path = t["path"]
+                title = t.get("title", track_path.stem)
+                author = t.get("author", "SoundCloud Artist")
+                thumb_path = t.get("thumb")
+                dur = get_audio_duration_seconds(track_path)
+                progress = TelegramProgress(status_msg, action=f"Uploading {title[:20]}", buttons=make_cancel_button(task_id))
+                await client.send_file(
+                    event.chat_id,
+                    track_path,
+                    caption=f"☁️ **SoundCloud**\n🎵 `{title}`",
+                    thumb=thumb_path if thumb_path and thumb_path.exists() else None,
+                    attributes=[DocumentAttributeAudio(duration=dur, title=title, performer=author)],
+                    progress_callback=progress.callback,
+                )
+
+            await status_msg.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"SoundCloud job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"SoundCloud error: {e}")
+        await status_msg.edit(f"❌ **Error downloading SoundCloud audio:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# Facebook Job
+# -------------------------------------------------------------
+async def run_facebook_job(event, url: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.reply(
+        "⏳ **Fetching Facebook video / Reel...**",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            res = await FacebookDownloader.download(url, task_dir)
+            if not res.get("success") or not res.get("path"):
+                await status_msg.edit(f"❌ **{res.get('error', 'Could not download Facebook video.')}**")
+                return
+
+            vid_path = res["path"]
+            title = res.get("title", "Facebook Video")
+            author = res.get("author", "Facebook")
+            caption = f"📘 **Facebook by {author}**\n\n{title}".strip()
+
+            progress = TelegramProgress(status_msg, action="Uploading Facebook video", buttons=make_cancel_button(task_id))
+            await client.send_file(
+                event.chat_id,
+                vid_path,
+                caption=caption,
+                supports_streaming=True,
+                progress_callback=progress.callback,
+            )
+
+            await status_msg.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"Facebook job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Facebook error: {e}")
+        await status_msg.edit(f"❌ **Error downloading Facebook video:** {str(e)}")
     finally:
         cleanup_dir(task_dir)
         active_jobs.pop(task_id, None)
