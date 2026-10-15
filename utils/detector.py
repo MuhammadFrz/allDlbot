@@ -1,7 +1,7 @@
 import re
 from typing import Tuple, Optional
 
-URL_REGEX = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
+URL_REGEX = re.compile(r'(?:https?://|www\.|market://)[^\s<>"]+')
 
 PLATFORM_PATTERNS = {
     "youtube": re.compile(r'(?:youtube\.com/(?:watch\?|shorts/|embed/|live/|v/|.*[?&]v=)|youtu\.be/|music\.youtube\.com/)', re.IGNORECASE),
@@ -13,6 +13,7 @@ PLATFORM_PATTERNS = {
     "reddit": re.compile(r'(?:(?:(?:www|old|new)\.)?reddit\.com/(?:r/[^/]+/comments/|gallery/|user/[^/]+/comments/)|redd\.it/|v\.redd\.it/)', re.IGNORECASE),
     "soundcloud": re.compile(r'(?:soundcloud\.com/[^/]+/(?:[^/]+|sets/[^/]+)|on\.soundcloud\.com/)', re.IGNORECASE),
     "facebook": re.compile(r'(?:(?:www|m|web)\.)?(?:facebook\.com/(?:watch\?|reel/|reels/|.*[?&]v=|share/|videos/|story\.php|permalink\.php)|fb\.watch/|fb\.com/)', re.IGNORECASE),
+    "googleplay": re.compile(r'(?:(?:play\.google\.com/store/apps/details\?|market://details\?)|(?:[a-z]{2,}\.)?google\.com/store/apps/details\?)', re.IGNORECASE),
 }
 
 def extract_url(text: str) -> Optional[str]:
@@ -36,7 +37,7 @@ def detect_platform(url: str) -> Tuple[Optional[str], str]:
         return None, ""
     
     # Normalize URL if missing schema
-    if not url.startswith("http://") and not url.startswith("https://"):
+    if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("market://"):
         url = "https://" + url
 
     for platform, pattern in PLATFORM_PATTERNS.items():

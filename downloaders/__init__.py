@@ -7,6 +7,7 @@ from .pinterest import PinterestDownloader
 from .reddit import RedditDownloader
 from .soundcloud import SoundCloudDownloader
 from .facebook import FacebookDownloader
+from .googleplay import GooglePlayDownloader
 
 __all__ = [
     "YouTubeDownloader",
@@ -18,4 +19,5 @@ __all__ = [
     "RedditDownloader",
     "SoundCloudDownloader",
     "FacebookDownloader",
+    "GooglePlayDownloader",
 ]

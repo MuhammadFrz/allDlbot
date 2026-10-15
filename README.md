@@ -5,7 +5,7 @@
 [![FFmpeg](https://img.shields.io/badge/multimedia-FFmpeg-green.svg)](https://ffmpeg.org/)
 [![Status](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 
-An advanced, asynchronous Telegram Bot built with Python and Telethon (MTProto) that downloads and converts media from **TikTok, Instagram, Twitter / X, Spotify, YouTube, Pinterest, Reddit, SoundCloud, and Facebook** directly inside Telegram with **zero slash commands required**.
+An advanced, asynchronous Telegram Bot built with Python and Telethon (MTProto) that downloads and converts media from **TikTok, Instagram, Twitter / X, Spotify, YouTube, Google Play Store (APKs), Pinterest, Reddit, SoundCloud, and Facebook** directly inside Telegram with **zero slash commands required**.
 
 Designed with a **button-first interface**, **interactive cancellation on all tasks**, and a strict **zero-waste server storage policy** with no disk caching.
 
@@ -41,28 +41,37 @@ Designed with a **button-first interface**, **interactive cancellation on all ta
 - **GIF Converter**: Turn YouTube clips into animated GIFs.
 - Works seamlessly on both regular videos and YouTube Shorts.
 
-### 📌 6. Pinterest
+### 🏪 6. Google Play Store (APKs & XAPKs)
+- **Interactive Architecture & RAM Selector**:
+  - 📱 **ARM64 (arm64-v8a)**: Recommended for modern 64-bit phones (4GB, 6GB, 8GB+ RAM).
+  - 📱 **ARMv7 (armeabi-v7a)**: 32-bit architecture for older devices or low-RAM devices (<4GB RAM).
+  - 💻 **x86_64 / x86**: For PC Android emulators (BlueStacks, LDPlayer, Nox) & Chromebooks.
+  - 🌐 **Universal**: Universal package compatible across all devices.
+- **Rich Metadata & Cover Art**: Automatically pulls the official app title, developer, current version, star rating, category, and real app icon thumbnail.
+- **Ready-To-Install Delivery**: Sends as a direct Telegram document for 1-tap installation on Android.
+
+### 📌 7. Pinterest
 - **Original Full-Resolution Images**: Bypasses downscaling to extract the raw maximum-resolution image files.
 - **HD Video Pins**: High-definition MP4 downloads without watermarks.
 - **GIFs & Idea Pins**: Animated and multi-media support.
 - Supports both `pinterest.com` pins and `pin.it` shortlinks.
 
-### 🤖 7. Reddit
+### 🤖 8. Reddit
 - **Videos with Audio (Merged)**: Fixes Reddit's split audio/video stream issue by automatically muxing DASH video and audio using FFmpeg into a single high-quality MP4.
 - **Multi-Image Galleries**: Downloads all images in gallery posts into a Telegram album.
 - **Native GIFs & Single Images**: Supports `i.redd.it`, `v.redd.it`, and direct image links.
 
-### ☁️ 8. SoundCloud
+### ☁️ 9. SoundCloud
 - **High Quality 320kbps MP3**: Downloads tracks and sets.
 - **500x500 Cover Artwork**: Automatically embeds high-resolution album artwork into MP3 tags.
 - **Full ID3 Metadata**: Artist, title, and track duration embedded for native Telegram audio playback.
 
-### 📘 9. Facebook
+### 📘 10. Facebook
 - **Reels & Watch Videos**: Fast MP4 streaming video extraction.
 - **Public Posts**: High definition 1080p/720p downloads.
 - Supports `facebook.com` and `fb.watch` shortlinks.
 
-### 🔄 10. Built-in Media Converter & Video Tools
+### 🔄 11. Built-in Media Converter & Video Tools
 - Send or forward **any video file** directly to the bot:
   - 🎵 **Extract MP3 Audio**: 320kbps high-quality audio extraction.
   - 🎞️ **Convert to GIF**: 2-pass palette-generated high-fidelity animated GIF.
@@ -114,6 +123,7 @@ allDlbot/
 ├── downloaders/
 │   ├── __init__.py
 │   ├── youtube.py           # YouTube quality selector and downloader
+│   ├── googleplay.py        # Google Play APK downloader with RAM/Arch selector
 │   ├── instagram.py         # Instagram reels, carousels (all media items)
 │   ├── tiktok.py            # TikTok HD video & photo slideshows
 │   ├── twitter.py           # Twitter/X video, animated GIFs, multi-images
@@ -125,7 +135,7 @@ allDlbot/
 ├── utils/
 │   ├── __init__.py
 │   ├── converter.py         # FFmpeg video-to-audio, GIF, and resolution scaler
-│   ├── detector.py          # URL parser and platform router (9 platforms)
+│   ├── detector.py          # URL parser and platform router (10 platforms)
 │   ├── progress.py          # Throttled upload progress bar with cancel button
 │   └── cleanup.py           # Directory lifecycle, disk purger, garbage collector
 └── deploy/

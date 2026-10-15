@@ -29,6 +29,7 @@ from downloaders import (
     RedditDownloader,
     SoundCloudDownloader,
     FacebookDownloader,
+    GooglePlayDownloader,
 )
 
 # Setup Logging
@@ -38,8 +39,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AllDLBot")
 
-# In-memory storage for active download tasks and pending YouTube menus
+# In-memory storage for active download tasks and pending menus
 pending_yt_tasks: Dict[str, Dict[str, Any]] = {}
+pending_gplay_tasks: Dict[str, Dict[str, Any]] = {}
 active_jobs: Dict[str, Dict[str, Any]] = {}
 active_semaphore = asyncio.Semaphore(config.CONCURRENT_DOWNLOADS)
 
@@ -94,6 +96,9 @@ PLATFORM_INLINE_BUTTONS = [
     ],
     [
         Button.inline("📘 Facebook", data=b"plat:facebook"),
+        Button.inline("🏪 Google Play", data=b"plat:googleplay"),
+    ],
+    [
         Button.inline("🔄 Media Converter", data=b"plat:converter"),
     ],
 ]
@@ -110,6 +115,7 @@ async def start_handler(event):
         "• 🐦 **Twitter / X**: HD Videos, Animated GIFs, Multi-image tweets\n"
         "• 🎧 **Spotify**: 320kbps MP3 with album artwork & tags\n"
         "• 📺 **YouTube**: Videos, Shorts, Quality Selector (1080p, 720p, 480p, 360p) & MP3\n"
+        "• 🏪 **Google Play**: Direct APK/XAPK downloads with **RAM / Architecture selector**\n"
         "• 📌 **Pinterest**: Original High-Res Images & HD Video Pins\n"
         "• 🤖 **Reddit**: Videos with audio merged, Multi-Image Galleries, GIFs\n"
         "• ☁️ **SoundCloud**: 320kbps MP3 with 500x500 Cover Art & Tags\n"
@@ -127,6 +133,7 @@ async def download_menu_button(event):
         "📥 **Download Media Mode**\n\n"
         "Simply send or paste any public link directly into this chat.\n\n"
         "🌐 **Supported Links:**\n"
+        "• `play.google.com/store/apps/...` (APKs with RAM / CPU Architecture selector)\n"
         "• `tiktok.com/...` (Watermark-free video, audio, or slideshows)\n"
         "• `instagram.com/...` (Reels, posts, carousels with all media)\n"
         "• `x.com/...` or `twitter.com/...` (Videos, GIFs, images)\n"
@@ -168,15 +175,22 @@ async def platforms_menu_button(event):
 async def help_menu_button(event):
     help_text = (
         "📖 **How to Use This Bot (No Slash Commands Needed!):**\n\n"
-        "1️⃣ **Downloading Media:**\n"
-        "   Just copy a link from TikTok, Instagram, Twitter, Spotify, or YouTube and send it in this chat.\n\n"
-        "2️⃣ **YouTube Quality Selector:**\n"
+        "1️⃣ **Downloading Media & Apps:**\n"
+        "   Just copy a link from Google Play, YouTube, TikTok, Instagram, Twitter, or Spotify and send it in this chat.\n\n"
+        "2️⃣ **Google Play Architecture & RAM Selector:**\n"
+        "   When you paste a Google Play link, buttons appear to select your device's architecture:\n"
+        "   • `ARM64 (arm64-v8a)`: For modern phones (4GB, 6GB, 8GB+ RAM)\n"
+        "   • `ARMv7 (armeabi-v7a)`: For older phones (<4GB RAM)\n"
+        "   • `x86_64 / x86`: For PC Emulators (BlueStacks, LDPlayer)\n"
+        "   • `Universal`: Compatible across all devices\n"
+        "   Tap your choice and the bot immediately downloads and delivers the ready-to-install APK!\n\n"
+        "3️⃣ **YouTube Quality Selector:**\n"
         "   When you paste a YouTube link, buttons appear for `1080p`, `720p`, `480p`, `360p`, or `Audio MP3`. Tap your choice to download!\n\n"
-        "3️⃣ **Instagram Multiple Media (Carousels):**\n"
+        "4️⃣ **Instagram Multiple Media (Carousels):**\n"
         "   If a post contains multiple photos and videos, the bot downloads **ALL of them** and delivers them as an organized album!\n\n"
-        "4️⃣ **Cancel Button on Tasks:**\n"
+        "5️⃣ **Cancel Button on Tasks:**\n"
         "   Every active task has an inline `[❌ Cancel]` button so you can stop it anytime.\n\n"
-        "5️⃣ **Converting Videos:**\n"
+        "6️⃣ **Converting Videos:**\n"
         "   Send any video directly to the bot and tap `Extract MP3` or `Convert to GIF`."
     )
     await event.respond(help_text, buttons=MAIN_KEYBOARD, parse_mode="md")
@@ -187,6 +201,17 @@ async def platform_info_callback(event):
     plat = event.pattern_match.group(1).decode("utf-8")
     
     details = {
+        "googleplay": (
+            "🏪 **Google Play Downloader**\n\n"
+            "• **Direct APK & XAPK Download**: Fast, safe downloads from Google Play.\n"
+            "• **RAM & Architecture Selector**:\n"
+            "  - 📱 `ARM64 (arm64-v8a)`: Modern 64-bit phones (4GB, 6GB, 8GB+ RAM)\n"
+            "  - 📱 `ARMv7 (armeabi-v7a)`: 32-bit devices (<4GB RAM / Older phones)\n"
+            "  - 💻 `x86_64 / x86`: PC Emulators & Chromebooks\n"
+            "  - 🌐 `Universal`: Universal APK compatible with all devices\n"
+            "• **Full App Details & Icon**: App name, developer, version, star rating, and icon.\n\n"
+            "💡 *Paste any Google Play link to try it!*"
+        ),
         "tiktok": (
             "🎵 **TikTok Downloader**\n\n"
             "• **Watermark-Free HD**: Direct clean video.\n"
@@ -345,15 +370,25 @@ async def message_handler(event):
     # Extract URL from message
     url = extract_url(event.raw_text)
     if not url:
-        return
-
-    platform, normalized_url = detect_platform(url)
-    if not platform:
-        return
+        # Check if user sent a direct Google Play package ID (e.g. com.whatsapp)
+        raw_pkg = GooglePlayDownloader.extract_package_id(text_content)
+        if raw_pkg:
+            platform = "googleplay"
+            normalized_url = f"https://play.google.com/store/apps/details?id={raw_pkg}"
+        else:
+            return
+    else:
+        platform, normalized_url = detect_platform(url)
+        if not platform:
+            return
 
     logger.info(f"Detected platform: {platform} for URL: {normalized_url}")
 
-    if platform == "youtube":
+    if platform == "googleplay":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(handle_googleplay_request(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "youtube":
         task_id = uuid.uuid4().hex[:8]
         t = asyncio.create_task(handle_youtube_request(event, normalized_url, task_id))
         active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
@@ -389,6 +424,166 @@ async def message_handler(event):
         task_id = uuid.uuid4().hex[:8]
         t = asyncio.create_task(run_facebook_job(event, normalized_url, task_id))
         active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+
+
+# -------------------------------------------------------------
+# Google Play Handler & Architecture Selector
+# -------------------------------------------------------------
+async def handle_googleplay_request(event, url: str, task_id: str):
+    status_msg = await event.reply("🔍 **Fetching Google Play app information...**", buttons=make_cancel_button(task_id))
+
+    try:
+        package_id = GooglePlayDownloader.extract_package_id(url)
+        if not package_id:
+            await status_msg.edit("❌ **Invalid Google Play link.** Could not extract a package ID (`id=...`).")
+            return
+
+        info = await asyncio.to_thread(GooglePlayDownloader.get_app_info, package_id)
+        if not info:
+            await status_msg.edit("❌ **Could not retrieve app details.** Please check the link or package ID.")
+            return
+
+        pending_gplay_tasks[task_id] = info
+
+        rating_str = info.get("rating") or "N/A"
+        version_str = info.get("version") or "Latest"
+        genre_str = info.get("genre") or "Application"
+        dev_str = info.get("developer") or "Google Play Developer"
+
+        caption = (
+            f"🏪 **{info['title']}**\n\n"
+            f"👤 **Developer:** `{dev_str}`\n"
+            f"📦 **Package ID:** `{info['package_id']}`\n"
+            f"🔢 **Version:** `{version_str}`\n"
+            f"⭐ **Rating:** `{rating_str}`\n"
+            f"📂 **Category:** `{genre_str}`\n\n"
+            f"📱 **Which architecture is your device / RAM?**\n"
+            f"Select the CPU & RAM architecture matching your Android device:\n\n"
+            f"• 📱 **ARM64 (arm64-v8a)**: Modern 64-bit devices (4GB, 6GB, 8GB+ RAM)\n"
+            f"• 📱 **ARMv7 (armeabi-v7a)**: 32-bit devices (<4GB RAM / Older phones)\n"
+            f"• 💻 **x86_64 / x86**: PC Emulators (BlueStacks, LDPlayer, Nox)\n"
+            f"• 🌐 **Universal**: Universal package for all devices\n\n"
+            f"👉 **Tap a button below to start download:**"
+        )
+
+        buttons = [
+            [
+                Button.inline("📱 ARM64 (arm64-v8a | 4GB+ RAM)", data=f"gp:{task_id}:arm64-v8a"),
+            ],
+            [
+                Button.inline("📱 ARMv7 (armeabi-v7a | <4GB RAM)", data=f"gp:{task_id}:armeabi-v7a"),
+            ],
+            [
+                Button.inline("💻 x86_64 (64-bit PC)", data=f"gp:{task_id}:x86_64"),
+                Button.inline("💻 x86 (32-bit PC)", data=f"gp:{task_id}:x86"),
+            ],
+            [
+                Button.inline("🌐 Universal (Compatible All)", data=f"gp:{task_id}:universal"),
+            ],
+            [Button.inline("❌ Cancel", data=f"cancel_gp:{task_id}")],
+        ]
+
+        await status_msg.edit(caption, buttons=buttons)
+    except asyncio.CancelledError:
+        await status_msg.edit("❌ **Cancelled by user.**")
+    except Exception as e:
+        logger.error(f"Google Play request error: {e}")
+        await status_msg.edit(f"❌ **Error:** {str(e)}")
+    finally:
+        active_jobs.pop(task_id, None)
+
+
+@client.on(events.CallbackQuery(pattern=r"^gp:(.+):(.+)$"))
+async def googleplay_callback(event):
+    task_id = event.pattern_match.group(1).decode("utf-8")
+    arch = event.pattern_match.group(2).decode("utf-8")
+
+    task_info = pending_gplay_tasks.pop(task_id, None)
+    if not task_info:
+        await event.answer("Task expired. Please re-send the Google Play link.", alert=True)
+        return
+
+    job_task_id = uuid.uuid4().hex[:8]
+    t = asyncio.create_task(run_googleplay_job(event, task_info, arch, job_task_id))
+    active_jobs[job_task_id] = {"task": t, "chat_id": event.chat_id}
+
+
+@client.on(events.CallbackQuery(pattern=r"^cancel_gp:(.+)$"))
+async def cancel_gp_callback(event):
+    task_id = event.pattern_match.group(1).decode("utf-8")
+    pending_gplay_tasks.pop(task_id, None)
+    await event.edit("❌ **Operation cancelled.**")
+
+
+async def run_googleplay_job(event, task_info: Dict[str, Any], arch: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    arch_labels = {
+        "arm64-v8a": "ARM64 (4GB+ RAM)",
+        "armeabi-v7a": "ARMv7 (<4GB RAM)",
+        "x86_64": "x86_64 (64-bit PC)",
+        "x86": "x86 (32-bit PC)",
+        "universal": "Universal",
+    }
+    label = arch_labels.get(arch, arch)
+
+    status_msg = await event.edit(
+        f"⏳ **Downloading {task_info['title']} ({label})...**\nPlease wait, preparing installation package...",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            cancel_check = lambda: task_id not in active_jobs
+            res = await asyncio.to_thread(
+                GooglePlayDownloader.download,
+                task_info["package_id"],
+                arch,
+                task_dir,
+                cancel_check,
+            )
+
+            if not res.get("success") or not res.get("path"):
+                await event.edit(f"❌ **Download failed:** {res.get('error', 'Unknown error')}")
+                return
+
+            file_path = res["path"]
+            thumb_path = res.get("thumb_path")
+            file_type = res.get("file_type", "apk").upper()
+            size_str = human_bytes(res.get("size_bytes", file_path.stat().st_size))
+
+            progress = TelegramProgress(event, action=f"Uploading {file_type} to Telegram", buttons=make_cancel_button(task_id))
+            caption = (
+                f"🏪 **{res.get('title', task_info['title'])}**\n"
+                f"👤 Developer: `{res.get('developer', task_info.get('developer', 'Unknown'))}`\n"
+                f"📦 Package: `{task_info['package_id']}`\n"
+                f"⚙️ Architecture: `{label}`\n"
+                f"🔢 Version: `{res.get('version', 'Latest')}`\n"
+                f"💾 Size: `{size_str}`\n"
+                f"📁 Format: `{file_type}`"
+            )
+
+            await client.send_file(
+                event.chat_id,
+                file_path,
+                caption=caption,
+                thumb=thumb_path if thumb_path and thumb_path.exists() else None,
+                force_document=True,
+                progress_callback=progress.callback,
+            )
+
+            await event.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"Google Play job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Google Play download/upload error: {e}")
+        await event.edit(f"❌ **Error:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
 
 
 # -------------------------------------------------------------
