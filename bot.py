@@ -752,8 +752,12 @@ async def run_instagram_job(event, url: str, task_id: str):
             if len(caption) > 800:
                 caption = caption[:800] + "..."
             
-            author = res.get("author", "Instagram")
-            full_caption = f"📸 **Instagram by {author}**\n\n{caption}".strip()
+            author = res.get("author", "").strip()
+            if author and author.lower() not in ["instagram", "instagram user"]:
+                header = f"📸 **Instagram by {author}**"
+            else:
+                header = "📸 **Instagram**"
+            full_caption = f"{header}\n\n{caption}".strip() if caption else header
 
             await status_msg.edit(f"📤 **Uploading {len(media_items)} media item(s)...**", buttons=make_cancel_button(task_id))
             file_paths = [item["path"] for item in media_items]
