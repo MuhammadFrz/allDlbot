@@ -44,4 +44,8 @@ def detect_platform(url: str) -> Tuple[Optional[str], str]:
         if pattern.search(url):
             return platform, url
             
+    # Generic direct HTTP/HTTPS link fallback
+    if url.startswith("http://") or url.startswith("https://"):
+        return "direct", url
+
     return None, url

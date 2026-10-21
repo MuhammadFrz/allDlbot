@@ -16,7 +16,7 @@ from utils.cleanup import (
     purge_all_downloads,
     periodic_cleaner_task,
 )
-from utils.progress import TelegramProgress, human_bytes
+from utils.progress import TelegramProgress, human_bytes, create_bar
 from utils.detector import extract_url, detect_platform
 from utils.converter import video_to_mp3, video_to_gif, convert_video_quality, extract_thumbnail
 from downloaders import (
@@ -30,6 +30,7 @@ from downloaders import (
     SoundCloudDownloader,
     FacebookDownloader,
     GooglePlayDownloader,
+    DirectDownloader,
 )
 
 # Setup Logging
@@ -100,6 +101,7 @@ PLATFORM_INLINE_BUTTONS = [
     ],
     [
         Button.inline("🔄 Media Converter", data=b"plat:converter"),
+        Button.inline("🔗 Direct Links", data=b"plat:direct"),
     ],
 ]
 
@@ -120,6 +122,7 @@ async def start_handler(event):
         "• 🤖 **Reddit**: Videos with audio merged, Multi-Image Galleries, GIFs\n"
         "• ☁️ **SoundCloud**: 320kbps MP3 with 500x500 Cover Art & Tags\n"
         "• 📘 **Facebook**: High Quality Reels & Watch Videos\n"
+        "• 🔗 **Direct Links**: Download files, videos, music, PDFs, APKs, & archives directly\n"
         "• 🔄 **Media Converter**: Convert any video to MP3, GIF, or change resolution!\n\n"
         "👇 **Tap a platform below to learn more, or paste your link directly:**"
     )
@@ -142,7 +145,8 @@ async def download_menu_button(event):
         "• `pinterest.com/...` or `pin.it/...` (Original photos & videos)\n"
         "• `reddit.com/...` or `redd.it/...` (Videos with sound & galleries)\n"
         "• `soundcloud.com/...` (320kbps MP3 with cover artwork)\n"
-        "• `facebook.com/...` or `fb.watch/...` (Reels & Watch videos)\n\n"
+        "• `facebook.com/...` or `fb.watch/...` (Reels & Watch videos)\n"
+        "• **Direct Links**: Any `http://` or `https://` direct file download link\n\n"
         "👇 **Paste your link here now:**"
     )
     await event.respond(text, buttons=MAIN_KEYBOARD, parse_mode="md")
@@ -285,6 +289,14 @@ async def platform_info_callback(event):
             "• **Quality Re-encoding**: 720p, 480p, 360p.\n\n"
             "💡 *Send any video file to this chat to start!*"
         ),
+        "direct": (
+            "🔗 **Direct File Downloader**\n\n"
+            "• **Any Direct Link**: Paste any direct HTTP or HTTPS download URL.\n"
+            "• **File Types**: Videos, Audio, PDFs, ZIP/RAR/7z Archives, APKs, Images, Documents, and ISOs.\n"
+            "• **Smart Streaming**: Automatic media player integration, thumbnail generation, and audio player tagging.\n"
+            "• **Speed**: Fast multi-threaded streaming up to 2GB per file.\n\n"
+            "💡 *Paste any direct file link to start downloading!*"
+        ),
     }
 
     text = details.get(plat, "Select a platform to view details.")
@@ -423,6 +435,10 @@ async def message_handler(event):
     elif platform == "facebook":
         task_id = uuid.uuid4().hex[:8]
         t = asyncio.create_task(run_facebook_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "direct":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(run_direct_job(event, normalized_url, task_id))
         active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
 
 
@@ -1194,6 +1210,118 @@ async def run_facebook_job(event, url: str, task_id: str):
     except Exception as e:
         logger.error(f"Facebook error: {e}")
         await status_msg.edit(f"❌ **Error downloading Facebook video:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# Direct File Download Job
+# -------------------------------------------------------------
+async def run_direct_job(event, url: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.reply(
+        "⏳ **Connecting to direct download link...**\nPlease wait.",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            loop = asyncio.get_running_loop()
+
+            async def _safe_status_edit(text: str):
+                try:
+                    await status_msg.edit(text, buttons=make_cancel_button(task_id))
+                except Exception:
+                    pass
+
+            def on_progress(current: int, total: Optional[int]):
+                cur_str = human_bytes(current)
+                if total and total > 0:
+                    percent = min(100.0, (current / total) * 100)
+                    tot_str = human_bytes(total)
+                    bar = create_bar(percent)
+                    text = (
+                        f"⏳ **Downloading file from server...**\n\n"
+                        f"{bar} `{percent:.1f}%`\n"
+                        f"📦 **Downloaded:** `{cur_str} / {tot_str}`"
+                    )
+                else:
+                    text = (
+                        f"⏳ **Downloading file from server...**\n\n"
+                        f"📦 **Downloaded:** `{cur_str}`"
+                    )
+                asyncio.run_coroutine_threadsafe(_safe_status_edit(text), loop)
+
+            res = await DirectDownloader.download(url, task_dir, progress_callback=on_progress)
+            if not res.get("success") or not res.get("path"):
+                err = res.get("error", "Could not download file from direct link.")
+                await status_msg.edit(f"❌ **{err}**")
+                return
+
+            file_path = res["path"]
+            filename = res["filename"]
+            file_type = res["type"]
+            size_bytes = res["size_bytes"]
+            size_str = human_bytes(size_bytes)
+            thumb = res.get("thumb")
+            duration = res.get("duration", 0)
+
+            await status_msg.edit(
+                f"📤 **Uploading `{filename}` ({size_str}) to Telegram...**",
+                buttons=make_cancel_button(task_id)
+            )
+
+            progress = TelegramProgress(status_msg, action=f"Uploading {file_type.title()}", buttons=make_cancel_button(task_id))
+
+            if file_type == "video":
+                caption = f"🎬 **{filename}**\n📊 Size: `{size_str}`"
+                await client.send_file(
+                    event.chat_id,
+                    file_path,
+                    caption=caption,
+                    thumb=thumb if thumb and thumb.exists() else None,
+                    supports_streaming=True,
+                    progress_callback=progress.callback,
+                )
+            elif file_type == "audio":
+                caption = f"🎵 **{filename}**\n📊 Size: `{size_str}`"
+                await client.send_file(
+                    event.chat_id,
+                    file_path,
+                    caption=caption,
+                    thumb=thumb if thumb and thumb.exists() else None,
+                    attributes=[DocumentAttributeAudio(duration=duration, title=file_path.stem, performer="Direct Download")],
+                    progress_callback=progress.callback,
+                )
+            elif file_type == "photo" and size_bytes < 10 * 1024 * 1024:
+                caption = f"🖼️ **{filename}**\n📊 Size: `{size_str}`"
+                await client.send_file(
+                    event.chat_id,
+                    file_path,
+                    caption=caption,
+                    progress_callback=progress.callback,
+                )
+            else:
+                caption = f"📁 **{filename}**\n📊 Size: `{size_str}`"
+                await client.send_file(
+                    event.chat_id,
+                    file_path,
+                    caption=caption,
+                    force_document=True,
+                    progress_callback=progress.callback,
+                )
+
+            await status_msg.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"Direct download job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Direct download error: {e}")
+        await status_msg.edit(f"❌ **Direct download error:** {str(e)}")
     finally:
         cleanup_dir(task_dir)
         active_jobs.pop(task_id, None)
