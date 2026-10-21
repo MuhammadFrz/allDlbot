@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import asyncio
 import logging
@@ -18,7 +19,7 @@ from utils.cleanup import (
 )
 from utils.progress import TelegramProgress, human_bytes, create_bar
 from utils.detector import extract_url, detect_platform
-from utils.converter import video_to_mp3, video_to_gif, convert_video_quality, extract_thumbnail
+from utils.converter import video_to_mp3, video_to_gif, convert_video_quality, extract_thumbnail, convert_file_format
 from downloaders import (
     YouTubeDownloader,
     InstagramDownloader,
@@ -43,6 +44,9 @@ logger = logging.getLogger("AllDLBot")
 # In-memory storage for active download tasks and pending menus
 pending_yt_tasks: Dict[str, Dict[str, Any]] = {}
 pending_gplay_tasks: Dict[str, Dict[str, Any]] = {}
+pending_file_ops: Dict[str, Dict[str, Any]] = {}
+waiting_rename_tasks: Dict[int, str] = {}
+waiting_custom_ext_tasks: Dict[int, str] = {}
 active_jobs: Dict[str, Dict[str, Any]] = {}
 active_semaphore = asyncio.Semaphore(config.CONCURRENT_DOWNLOADS)
 
@@ -155,13 +159,14 @@ async def download_menu_button(event):
 @client.on(events.NewMessage(pattern=r"(?i)^(🔄 Media Converter|converter|تبدیل)"))
 async def converter_menu_button(event):
     text = (
-        "🔄 **Media Converter & Video Tools**\n\n"
-        "Send or forward **any video or audio file** directly into this chat.\n\n"
-        "Once you send a file, interactive buttons will appear with options to:\n"
-        "• 🎵 **Extract MP3 Audio** (High Quality 320kbps)\n"
-        "• 🎞️ **Convert to Animated GIF** (High Quality 2-pass)\n"
-        "• 🎬 **Convert Resolution** (720p HD, 480p SD, 360p Low)\n\n"
-        "👇 **Send or forward your video/audio file now:**"
+        "🔄 **Media Converter & File Tools**\n\n"
+        "Send or forward **any file, video, audio, image, or document** directly into this chat.\n\n"
+        "Interactive buttons will appear with options to:\n"
+        "• ✏️ **Rename File**: Change the name of any file instantly\n"
+        "• 🔄 **Change Format**: Convert audio (MP3, M4A, WAV, FLAC, OGG, OPUS), video (MP4, MKV, WEBM, AVI), images (PNG, JPG, WEBP, PDF), or custom extensions\n"
+        "• 🎵 **Extract Audio**: Extract 320kbps MP3 from video\n"
+        "• 🎞️ **Convert to GIF**: High-quality animated GIF\n\n"
+        "👇 **Send or forward any file now:**"
     )
     await event.respond(text, buttons=MAIN_KEYBOARD, parse_mode="md")
 
@@ -180,22 +185,16 @@ async def help_menu_button(event):
     help_text = (
         "📖 **How to Use This Bot (No Slash Commands Needed!):**\n\n"
         "1️⃣ **Downloading Media & Apps:**\n"
-        "   Just copy a link from Google Play, YouTube, TikTok, Instagram, Twitter, or Spotify and send it in this chat.\n\n"
-        "2️⃣ **Google Play Architecture & RAM Selector:**\n"
-        "   When you paste a Google Play link, buttons appear to select your device's architecture:\n"
-        "   • `ARM64 (arm64-v8a)`: For modern phones (4GB, 6GB, 8GB+ RAM)\n"
-        "   • `ARMv7 (armeabi-v7a)`: For older phones (<4GB RAM)\n"
-        "   • `x86_64 / x86`: For PC Emulators (BlueStacks, LDPlayer)\n"
-        "   • `Universal`: Compatible across all devices\n"
-        "   Tap your choice and the bot immediately downloads and delivers the ready-to-install APK!\n\n"
-        "3️⃣ **YouTube Quality Selector:**\n"
-        "   When you paste a YouTube link, buttons appear for `1080p`, `720p`, `480p`, `360p`, or `Audio MP3`. Tap your choice to download!\n\n"
-        "4️⃣ **Instagram Multiple Media (Carousels):**\n"
-        "   If a post contains multiple photos and videos, the bot downloads **ALL of them** and delivers them as an organized album!\n\n"
+        "   Just copy a link from Google Play, YouTube, TikTok, Instagram, Twitter, Spotify, SoundCloud, Facebook, Reddit, or Direct Download links and send it here.\n\n"
+        "2️⃣ **Rename Files & Change Formats:**\n"
+        "   Forward or send **any file, video, audio, image, or document** to the bot.\n"
+        "   Interactive buttons will appear to `✏️ Rename File` or `🔄 Change Format`!\n\n"
+        "3️⃣ **Google Play Architecture & RAM Selector:**\n"
+        "   Select ARM64, ARMv7, x86_64, or Universal for ready-to-install APKs.\n\n"
+        "4️⃣ **YouTube Quality Selector:**\n"
+        "   Choose 1080p, 720p, 480p, 360p, or Audio MP3.\n\n"
         "5️⃣ **Cancel Button on Tasks:**\n"
-        "   Every active task has an inline `[❌ Cancel]` button so you can stop it anytime.\n\n"
-        "6️⃣ **Converting Videos:**\n"
-        "   Send any video directly to the bot and tap `Extract MP3` or `Convert to GIF`."
+        "   Every active task has an inline `[❌ Cancel]` button so you can stop it anytime."
     )
     await event.respond(help_text, buttons=MAIN_KEYBOARD, parse_mode="md")
 
@@ -347,6 +346,8 @@ async def cancel_menu_callback(event):
 
 @client.on(events.CallbackQuery(pattern=r"^cancel_menu$"))
 async def cancel_menu_general(event):
+    waiting_rename_tasks.pop(event.chat_id, None)
+    waiting_custom_ext_tasks.pop(event.chat_id, None)
     await event.edit("❌ **Operation cancelled.**")
 
 
@@ -359,25 +360,99 @@ async def message_handler(event):
     ]:
         return
 
-    # Check for direct media upload (for converter)
-    if event.message.video or event.message.document:
-        if event.message.video or (event.message.document and getattr(event.message.document, 'mime_type', '').startswith("video")):
-            file_id = f"{event.chat_id}_{event.message.id}"
-            buttons = [
-                [
-                    Button.inline("🎵 Extract MP3 Audio", data=f"conv:mp3:{file_id}"),
-                    Button.inline("🎞️ Convert to GIF", data=f"conv:gif:{file_id}"),
-                ],
-                [
-                    Button.inline("🎬 Convert to 720p", data=f"conv:720:{file_id}"),
-                    Button.inline("🎬 Convert to 480p", data=f"conv:480:{file_id}"),
-                ],
-                [
-                    Button.inline("❌ Cancel", data=b"cancel_menu"),
-                ],
-            ]
-            await event.reply("🔄 **Select a conversion option for this video:**", buttons=buttons)
+    # Check if user was waiting to rename a file or enter a custom extension
+    if event.chat_id in waiting_rename_tasks:
+        if not text_content.startswith("/") and not extract_url(text_content):
+            file_id = waiting_rename_tasks.pop(event.chat_id)
+            file_info = pending_file_ops.get(file_id)
+            if not file_info:
+                await event.reply("⚠️ **Session expired or file not found.** Please forward or send the file again.")
+                return
+            task_id = uuid.uuid4().hex[:8]
+            t = asyncio.create_task(run_rename_file_job(event, file_info, text_content, task_id))
+            active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
             return
+        else:
+            # User sent command or URL, abandon rename state and proceed
+            waiting_rename_tasks.pop(event.chat_id, None)
+
+    if event.chat_id in waiting_custom_ext_tasks:
+        if not text_content.startswith("/") and not extract_url(text_content):
+            file_id = waiting_custom_ext_tasks.pop(event.chat_id)
+            file_info = pending_file_ops.get(file_id)
+            if not file_info:
+                await event.reply("⚠️ **Session expired or file not found.** Please forward or send the file again.")
+                return
+            target_ext = text_content.strip().lower()
+            if not target_ext.startswith("."):
+                target_ext = f".{target_ext}"
+            task_id = uuid.uuid4().hex[:8]
+            t = asyncio.create_task(run_convert_file_job(event, file_info, target_ext, task_id))
+            active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+            return
+        else:
+            # User sent command or URL, abandon custom ext state and proceed
+            waiting_custom_ext_tasks.pop(event.chat_id, None)
+
+    # Check for any forwarded or sent file attachment (video, audio, photo, document, voice)
+    if event.message.file or event.message.photo:
+        file_obj = event.message.file
+        original_name = getattr(file_obj, 'name', None) if file_obj else None
+        ext = (getattr(file_obj, 'ext', None) or "").lower() if file_obj else ""
+        size = getattr(file_obj, 'size', 0) if file_obj else 0
+        mime_type = (getattr(file_obj, 'mime_type', '') or '').lower() if file_obj else ""
+
+        if not original_name:
+            if event.message.photo:
+                original_name = f"photo_{event.message.id}.jpg"
+                ext = ".jpg"
+                mime_type = "image/jpeg"
+            elif event.message.video:
+                original_name = f"video_{event.message.id}{ext or '.mp4'}"
+            elif event.message.audio or event.message.voice:
+                original_name = f"audio_{event.message.id}{ext or '.mp3'}"
+            else:
+                original_name = f"file_{event.message.id}{ext or ''}"
+
+        if not ext and "." in original_name:
+            ext = Path(original_name).suffix.lower()
+
+        file_id = f"{event.chat_id}_{event.message.id}"
+        pending_file_ops[file_id] = {
+            "chat_id": event.chat_id,
+            "message_id": event.message.id,
+            "original_name": original_name,
+            "size": size,
+            "mime_type": mime_type,
+            "ext": ext,
+        }
+
+        is_video = event.message.video or mime_type.startswith("video") or ext in [".mp4", ".mkv", ".webm", ".avi", ".mov"]
+
+        buttons = [
+            [
+                Button.inline("✏️ Rename File", data=f"fop:rename:{file_id}"),
+                Button.inline("🔄 Change Format", data=f"fop:fmt_menu:{file_id}"),
+            ],
+        ]
+
+        if is_video:
+            buttons.append([
+                Button.inline("🎵 Extract MP3", data=f"conv:mp3:{file_id}"),
+                Button.inline("🎞️ Convert to GIF", data=f"conv:gif:{file_id}"),
+            ])
+
+        buttons.append([Button.inline("❌ Cancel", data=b"cancel_menu")])
+
+        size_display = human_bytes(size) if size else "Unknown"
+        format_display = ext.upper().lstrip(".") if ext else "File"
+        prompt_text = (
+            f"📁 **File Received:** `{original_name}`\n"
+            f"📊 **Size:** `{size_display}` | **Type:** `{format_display}`\n\n"
+            f"Select what you would like to do with this file:"
+        )
+        await event.reply(prompt_text, buttons=buttons)
+        return
 
     # Extract URL from message
     url = extract_url(event.raw_text)
@@ -1353,6 +1428,10 @@ async def run_converter_job(event, conv_type: str, file_id: str, task_id: str):
     try:
         orig_msg = await event.get_reply_message()
         if not orig_msg or not orig_msg.media:
+            f_info = pending_file_ops.get(file_id)
+            if f_info:
+                orig_msg = await client.get_messages(f_info["chat_id"], ids=f_info["message_id"])
+        if not orig_msg or not orig_msg.media:
             await event.edit("❌ **Original media message not found.**")
             return
 
@@ -1403,6 +1482,378 @@ async def run_converter_job(event, conv_type: str, file_id: str, task_id: str):
     except Exception as e:
         logger.error(f"Converter error: {e}")
         await event.edit(f"❌ **Conversion error:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# File Operations: Rename & Format Conversion Handlers
+# -------------------------------------------------------------
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[\x00\\/:*?"<>|]', '_', name.strip())
+    cleaned = cleaned.strip(". ")
+    return cleaned or "file"
+
+
+@client.on(events.CallbackQuery(pattern=r"^fop:rename:(.+)$"))
+async def file_rename_callback(event):
+    file_id = event.pattern_match.group(1).decode("utf-8")
+    file_info = pending_file_ops.get(file_id)
+    if not file_info:
+        await event.edit("⚠️ **Session expired or file not found.** Please send or forward the file again.")
+        return
+
+    waiting_rename_tasks[event.chat_id] = file_id
+    waiting_custom_ext_tasks.pop(event.chat_id, None)
+
+    buttons = [
+        [Button.inline("⬅️ Back", data=f"fop:back:{file_id}")],
+        [Button.inline("❌ Cancel", data=b"cancel_menu")],
+    ]
+    ext_hint = f"`{file_info['ext']}`" if file_info.get("ext") else "the original extension"
+    msg_text = (
+        f"✏️ **Rename File:** `{file_info['original_name']}`\n\n"
+        f"Please send the **new name** for this file in your next message.\n"
+        f"_(Example: `My Presentation` or `Report_2026.pdf`)_\n\n"
+        f"💡 *Tip: If you omit the extension, {ext_hint} will be preserved automatically.*"
+    )
+    await event.edit(msg_text, buttons=buttons)
+
+
+@client.on(events.CallbackQuery(pattern=r"^fop:fmt_menu:(.+)$"))
+async def file_format_menu_callback(event):
+    file_id = event.pattern_match.group(1).decode("utf-8")
+    file_info = pending_file_ops.get(file_id)
+    if not file_info:
+        await event.edit("⚠️ **Session expired or file not found.** Please send or forward the file again.")
+        return
+
+    waiting_rename_tasks.pop(event.chat_id, None)
+    waiting_custom_ext_tasks.pop(event.chat_id, None)
+
+    ext = (file_info.get("ext") or "").lower()
+    mime = (file_info.get("mime_type") or "").lower()
+
+    if mime.startswith("video") or ext in [".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"]:
+        buttons = [
+            [
+                Button.inline("🎬 MP4", data=f"fop:conv:{file_id}:.mp4"),
+                Button.inline("🎬 MKV", data=f"fop:conv:{file_id}:.mkv"),
+            ],
+            [
+                Button.inline("🎬 WEBM", data=f"fop:conv:{file_id}:.webm"),
+                Button.inline("🎬 AVI", data=f"fop:conv:{file_id}:.avi"),
+            ],
+            [
+                Button.inline("🎵 MP3 Audio", data=f"fop:conv:{file_id}:.mp3"),
+                Button.inline("🎞️ GIF Animation", data=f"fop:conv:{file_id}:.gif"),
+            ],
+            [
+                Button.inline("⚙️ Custom Extension", data=f"fop:custom:{file_id}"),
+            ],
+            [
+                Button.inline("⬅️ Back", data=f"fop:back:{file_id}"),
+                Button.inline("❌ Cancel", data=b"cancel_menu"),
+            ],
+        ]
+    elif mime.startswith("audio") or ext in [".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"]:
+        buttons = [
+            [
+                Button.inline("🎵 MP3 (320k)", data=f"fop:conv:{file_id}:.mp3"),
+                Button.inline("🎵 M4A (AAC)", data=f"fop:conv:{file_id}:.m4a"),
+            ],
+            [
+                Button.inline("🎵 WAV (Lossless)", data=f"fop:conv:{file_id}:.wav"),
+                Button.inline("🎵 FLAC (Hi-Fi)", data=f"fop:conv:{file_id}:.flac"),
+            ],
+            [
+                Button.inline("🎵 OGG (Vorbis)", data=f"fop:conv:{file_id}:.ogg"),
+                Button.inline("🎵 OPUS", data=f"fop:conv:{file_id}:.opus"),
+            ],
+            [
+                Button.inline("⚙️ Custom Extension", data=f"fop:custom:{file_id}"),
+            ],
+            [
+                Button.inline("⬅️ Back", data=f"fop:back:{file_id}"),
+                Button.inline("❌ Cancel", data=b"cancel_menu"),
+            ],
+        ]
+    elif mime.startswith("image") or ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".pdf"]:
+        buttons = [
+            [
+                Button.inline("🖼️ PNG", data=f"fop:conv:{file_id}:.png"),
+                Button.inline("🖼️ JPG", data=f"fop:conv:{file_id}:.jpg"),
+            ],
+            [
+                Button.inline("🖼️ WEBP", data=f"fop:conv:{file_id}:.webp"),
+                Button.inline("📄 PDF Document", data=f"fop:conv:{file_id}:.pdf"),
+            ],
+            [
+                Button.inline("⚙️ Custom Extension", data=f"fop:custom:{file_id}"),
+            ],
+            [
+                Button.inline("⬅️ Back", data=f"fop:back:{file_id}"),
+                Button.inline("❌ Cancel", data=b"cancel_menu"),
+            ],
+        ]
+    else:
+        buttons = [
+            [
+                Button.inline("📄 PDF Document", data=f"fop:conv:{file_id}:.pdf"),
+                Button.inline("📝 Plain Text (TXT)", data=f"fop:conv:{file_id}:.txt"),
+            ],
+            [
+                Button.inline("📦 ZIP Archive", data=f"fop:conv:{file_id}:.zip"),
+                Button.inline("⚙️ Custom Extension", data=f"fop:custom:{file_id}"),
+            ],
+            [
+                Button.inline("⬅️ Back", data=f"fop:back:{file_id}"),
+                Button.inline("❌ Cancel", data=b"cancel_menu"),
+            ],
+        ]
+
+    msg_text = (
+        f"🔄 **Convert File Format**\n\n"
+        f"📄 File: `{file_info['original_name']}`\n"
+        f"Current Format: `{ext or 'None'}`\n\n"
+        f"Select a target format or enter a custom extension:"
+    )
+    await event.edit(msg_text, buttons=buttons)
+
+
+@client.on(events.CallbackQuery(pattern=r"^fop:custom:(.+)$"))
+async def file_custom_ext_callback(event):
+    file_id = event.pattern_match.group(1).decode("utf-8")
+    file_info = pending_file_ops.get(file_id)
+    if not file_info:
+        await event.edit("⚠️ **Session expired or file not found.** Please send or forward the file again.")
+        return
+
+    waiting_custom_ext_tasks[event.chat_id] = file_id
+    waiting_rename_tasks.pop(event.chat_id, None)
+
+    buttons = [
+        [Button.inline("⬅️ Back", data=f"fop:fmt_menu:{file_id}")],
+        [Button.inline("❌ Cancel", data=b"cancel_menu")],
+    ]
+    msg_text = (
+        f"⚙️ **Custom File Format / Extension**\n\n"
+        f"File: `{file_info['original_name']}`\n\n"
+        f"Please send the **target extension** in your next message.\n"
+        f"_(Example: `mp3`, `pdf`, `mp4`, `txt`, `docx`, `mkv`, `wav`, `zip`)_"
+    )
+    await event.edit(msg_text, buttons=buttons)
+
+
+@client.on(events.CallbackQuery(pattern=r"^fop:back:(.+)$"))
+async def file_back_callback(event):
+    file_id = event.pattern_match.group(1).decode("utf-8")
+    file_info = pending_file_ops.get(file_id)
+    if not file_info:
+        await event.edit("⚠️ **Session expired or file not found.** Please send or forward the file again.")
+        return
+
+    waiting_rename_tasks.pop(event.chat_id, None)
+    waiting_custom_ext_tasks.pop(event.chat_id, None)
+
+    ext = (file_info.get("ext") or "").lower()
+    mime_type = (file_info.get("mime_type") or "").lower()
+    is_video = mime_type.startswith("video") or ext in [".mp4", ".mkv", ".webm", ".avi", ".mov"]
+
+    buttons = [
+        [
+            Button.inline("✏️ Rename File", data=f"fop:rename:{file_id}"),
+            Button.inline("🔄 Change Format", data=f"fop:fmt_menu:{file_id}"),
+        ],
+    ]
+    if is_video:
+        buttons.append([
+            Button.inline("🎵 Extract MP3", data=f"conv:mp3:{file_id}"),
+            Button.inline("🎞️ Convert to GIF", data=f"conv:gif:{file_id}"),
+        ])
+    buttons.append([Button.inline("❌ Cancel", data=b"cancel_menu")])
+
+    size_display = human_bytes(file_info['size']) if file_info.get('size') else "Unknown"
+    format_display = ext.upper().lstrip(".") if ext else "File"
+    prompt_text = (
+        f"📁 **File Received:** `{file_info['original_name']}`\n"
+        f"📊 **Size:** `{size_display}` | **Type:** `{format_display}`\n\n"
+        f"Select what you would like to do with this file:"
+    )
+    await event.edit(prompt_text, buttons=buttons)
+
+
+@client.on(events.CallbackQuery(pattern=r"^fop:conv:(.+):(.+)$"))
+async def file_convert_direct_callback(event):
+    file_id = event.pattern_match.group(1).decode("utf-8")
+    target_ext = event.pattern_match.group(2).decode("utf-8")
+    file_info = pending_file_ops.get(file_id)
+    if not file_info:
+        await event.edit("⚠️ **Session expired or file not found.** Please send or forward the file again.")
+        return
+
+    task_id = uuid.uuid4().hex[:8]
+    t = asyncio.create_task(run_convert_file_job(event, file_info, target_ext, task_id))
+    active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+
+
+async def run_rename_file_job(event, file_info: Dict[str, Any], new_name_raw: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    clean_name = sanitize_filename(new_name_raw)
+    orig_ext = (file_info.get("ext") or "").lower()
+    if not Path(clean_name).suffix and orig_ext:
+        clean_name = f"{clean_name}{orig_ext}"
+
+    status_msg = await event.reply(
+        f"⏳ **Renaming file to:** `{clean_name}`\nDownloading original file...",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        orig_msg = await client.get_messages(file_info["chat_id"], ids=file_info["message_id"])
+        if not orig_msg or not orig_msg.media:
+            await status_msg.edit("❌ **Original file not found. It may have been deleted.**")
+            return
+
+        input_path = task_dir / clean_name
+        dl_prog = TelegramProgress(status_msg, action="Downloading original file", buttons=make_cancel_button(task_id))
+        await client.download_media(orig_msg.media, file=str(input_path), progress_callback=dl_prog.callback)
+
+        if not input_path.exists() or input_path.stat().st_size == 0:
+            await status_msg.edit("❌ **Failed to download original file.**")
+            return
+
+        up_prog = TelegramProgress(status_msg, action="Uploading renamed file", buttons=make_cancel_button(task_id))
+        file_ext = input_path.suffix.lower()
+        is_audio = file_ext in [".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"]
+        is_video = file_ext in [".mp4", ".mkv", ".webm", ".avi", ".mov"]
+
+        caption = f"✏️ **Renamed File:** `{clean_name}`\n📊 **Size:** `{human_bytes(input_path.stat().st_size)}`\n\nDownloaded with @AllDLBot"
+
+        if is_audio:
+            dur = get_audio_duration_seconds(input_path) if file_ext == ".mp3" else 0
+            await client.send_file(
+                file_info["chat_id"],
+                input_path,
+                caption=caption,
+                attributes=[DocumentAttributeAudio(duration=dur, title=input_path.stem, performer="AllDLBot")],
+                progress_callback=up_prog.callback,
+            )
+        elif is_video:
+            await client.send_file(
+                file_info["chat_id"],
+                input_path,
+                caption=caption,
+                supports_streaming=True,
+                progress_callback=up_prog.callback,
+            )
+        else:
+            await client.send_file(
+                file_info["chat_id"],
+                input_path,
+                caption=caption,
+                force_document=True,
+                progress_callback=up_prog.callback,
+            )
+
+        await status_msg.delete()
+        pending_file_ops.pop(f"{file_info['chat_id']}_{file_info['message_id']}", None)
+
+    except asyncio.CancelledError:
+        logger.info(f"Rename job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Rename error: {e}")
+        await status_msg.edit(f"❌ **Error while renaming:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+async def run_convert_file_job(event, file_info: Dict[str, Any], target_ext: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    target_ext = ("." + target_ext.lstrip(".")).lower()
+    orig_stem = Path(file_info.get("original_name", "file")).stem
+    clean_target_name = f"{sanitize_filename(orig_stem)}{target_ext}"
+
+    prompt = f"⏳ **Converting to {target_ext.upper()}...**\nDownloading original file..."
+    if isinstance(event, events.CallbackQuery.Event):
+        status_msg = await event.edit(prompt, buttons=make_cancel_button(task_id))
+    else:
+        status_msg = await event.reply(prompt, buttons=make_cancel_button(task_id))
+
+    try:
+        orig_msg = await client.get_messages(file_info["chat_id"], ids=file_info["message_id"])
+        if not orig_msg or not orig_msg.media:
+            await status_msg.edit("❌ **Original file not found. It may have been deleted.**")
+            return
+
+        input_path = task_dir / f"input_file{file_info.get('ext') or ''}"
+        dl_prog = TelegramProgress(status_msg, action="Downloading original file", buttons=make_cancel_button(task_id))
+        await client.download_media(orig_msg.media, file=str(input_path), progress_callback=dl_prog.callback)
+
+        if not input_path.exists() or input_path.stat().st_size == 0:
+            await status_msg.edit("❌ **Failed to download original file.**")
+            return
+
+        await status_msg.edit(
+            f"🔄 **Converting to {target_ext.upper()}...**\nPlease wait, this may take a few moments.",
+            buttons=make_cancel_button(task_id)
+        )
+
+        desired_output_path = task_dir / clean_target_name
+        output_file = await asyncio.to_thread(convert_file_format, input_path, target_ext, desired_output_path)
+
+        if not output_file or not output_file.exists() or output_file.stat().st_size == 0:
+            await status_msg.edit(f"❌ **Conversion to {target_ext.upper()} failed.** Format may not be supported for this file type.")
+            return
+
+        up_prog = TelegramProgress(status_msg, action=f"Uploading converted {target_ext.upper()} file", buttons=make_cancel_button(task_id))
+        caption = f"🔄 **Converted File:** `{output_file.name}`\n📦 **Format:** `{target_ext.upper()}` | **Size:** `{human_bytes(output_file.stat().st_size)}`\n\nDownloaded with @AllDLBot"
+
+        is_audio = target_ext in [".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"]
+        is_video = target_ext in [".mp4", ".mkv", ".webm", ".avi", ".mov"]
+
+        if is_audio:
+            dur = get_audio_duration_seconds(output_file) if target_ext == ".mp3" else 0
+            await client.send_file(
+                file_info["chat_id"],
+                output_file,
+                caption=caption,
+                attributes=[DocumentAttributeAudio(duration=dur, title=output_file.stem, performer="AllDLBot")],
+                progress_callback=up_prog.callback,
+            )
+        elif is_video:
+            await client.send_file(
+                file_info["chat_id"],
+                output_file,
+                caption=caption,
+                supports_streaming=True,
+                progress_callback=up_prog.callback,
+            )
+        else:
+            await client.send_file(
+                file_info["chat_id"],
+                output_file,
+                caption=caption,
+                force_document=True,
+                progress_callback=up_prog.callback,
+            )
+
+        await status_msg.delete()
+        pending_file_ops.pop(f"{file_info['chat_id']}_{file_info['message_id']}", None)
+
+    except asyncio.CancelledError:
+        logger.info(f"Convert job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Convert error: {e}")
+        await status_msg.edit(f"❌ **Error while converting:** {str(e)}")
     finally:
         cleanup_dir(task_dir)
         active_jobs.pop(task_id, None)

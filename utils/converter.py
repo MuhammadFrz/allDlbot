@@ -137,3 +137,87 @@ def convert_video_quality(input_path: Path, target_height: int = 720, output_pat
     except Exception as e:
         print(f"[Convert Quality Error] {e}")
     return None
+
+def convert_file_format(input_path: Path, target_ext: str, output_path: Optional[Path] = None) -> Optional[Path]:
+    """Convert any file to the specified target extension (e.g. mp4, mp3, mkv, webm, wav, png, jpg, pdf)."""
+    import shutil
+    from PIL import Image
+
+    target_ext = ("." + target_ext.lstrip(".")).lower()
+    if output_path is None:
+        output_path = input_path.parent / f"{input_path.stem}{target_ext}"
+
+    # If already the same extension, just return copy
+    if input_path.suffix.lower() == target_ext:
+        if input_path != output_path:
+            shutil.copy2(input_path, output_path)
+        return output_path
+
+    # GIF conversion
+    if target_ext == ".gif":
+        return video_to_gif(input_path, output_path)
+
+    # Audio conversions
+    audio_codecs = {
+        ".mp3": ["-vn", "-c:a", "libmp3lame", "-b:a", "320k"],
+        ".m4a": ["-vn", "-c:a", "aac", "-b:a", "256k"],
+        ".aac": ["-vn", "-c:a", "aac", "-b:a", "256k"],
+        ".wav": ["-vn", "-c:a", "pcm_s16le"],
+        ".flac": ["-vn", "-c:a", "flac"],
+        ".ogg": ["-vn", "-c:a", "libvorbis", "-q:a", "6"],
+        ".opus": ["-vn", "-c:a", "libopus", "-b:a", "192k"],
+    }
+    if target_ext in audio_codecs:
+        cmd = ["ffmpeg", "-y", "-i", str(input_path)] + audio_codecs[target_ext] + [str(output_path)]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            if output_path.exists():
+                return output_path
+        except Exception as e:
+            print(f"[Audio Convert Error] {e}")
+        return None
+
+    # Video conversions
+    video_codecs = {
+        ".mp4": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
+        ".mkv": ["-c:v", "libx264", "-c:a", "aac"],
+        ".webm": ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-c:a", "libopus"],
+        ".avi": ["-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame"],
+        ".mov": ["-c:v", "libx264", "-c:a", "aac"],
+    }
+    if target_ext in video_codecs:
+        cmd = ["ffmpeg", "-y", "-i", str(input_path)] + video_codecs[target_ext] + [str(output_path)]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            if output_path.exists():
+                return output_path
+        except Exception as e:
+            print(f"[Video Convert Error] {e}")
+        return None
+
+    # Image conversions (Pillow)
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"}
+    if target_ext in image_exts:
+        try:
+            img = Image.open(input_path)
+            if target_ext in [".jpg", ".jpeg", ".pdf"] and img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            if target_ext == ".pdf":
+                img.save(str(output_path), "PDF", resolution=100.0)
+            else:
+                img.save(str(output_path))
+            if output_path.exists():
+                return output_path
+        except Exception as e:
+            print(f"[Image Convert Error] {e}")
+
+    # Fallback for documents or generic file extension changes: simple file copy with new extension
+    try:
+        shutil.copy2(input_path, output_path)
+        if output_path.exists():
+            return output_path
+    except Exception as e:
+        print(f"[File Copy/Rename Error] {e}")
+
+    return None
+
