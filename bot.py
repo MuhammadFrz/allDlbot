@@ -107,7 +107,7 @@ def prepare_video_attributes(
             )
         )
 
-    final_thumb = thumb_path if (thumb_path and Path(thumb_path).exists()) else None
+    final_thumb = str(thumb_path) if (thumb_path and Path(thumb_path).exists() and Path(thumb_path).stat().st_size > 0) else None
     return attrs, final_thumb
 
 

@@ -31,16 +31,12 @@ def deploy():
     try:
         print_step("Connecting to server via SSH...")
         client.connect(VPS_IP, username=VPS_LOGIN, password=VPS_PASSWORD, timeout=15)
+        if client.get_transport():
+            client.get_transport().set_keepalive(10)
         print("Connected successfully!")
 
-        print_step("Installing system packages (FFmpeg, Python3, Pip)...")
-        install_cmd = (
-            "apt update -y && "
-            "apt install -y ffmpeg python3-pip python3-full curl && "
-            "mkdir -p /opt/alldlbot"
-        )
-        stdin, stdout, stderr = client.exec_command(install_cmd)
-        stdout.channel.recv_exit_status()
+        print_step("Stopping running bot service before update...")
+        client.exec_command("systemctl stop alldlbot")
 
         print_step("Uploading project files to /opt/alldlbot...")
         sftp = client.open_sftp()

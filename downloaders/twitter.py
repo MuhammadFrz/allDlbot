@@ -21,8 +21,6 @@ class TwitterDownloader:
             res = await asyncio.to_thread(TwitterDownloader._sync_download_api, url, task_dir)
             if res.get("success"):
                 return res
-            elif res.get("error"):
-                return res
         except Exception as e:
             print(f"[Twitter API error] {e}")
 
@@ -50,7 +48,6 @@ class TwitterDownloader:
             f"https://api.fxtwitter.com/{user}/status/{tweet_id}",
         ]
 
-        # Use TelegramBot User-Agent so Twitter embed APIs permit bot access
         headers = {
             "User-Agent": "TelegramBot (like TwitterBot)",
         }
@@ -61,12 +58,11 @@ class TwitterDownloader:
                 if resp.status_code != 200:
                     continue
 
-                # Check if API returned an HTML error page (e.g. suspended / deleted)
                 text_content = resp.text.strip()
                 if text_content.startswith("<"):
-                    if "Suspended" in text_content or "suspended" in text_content.lower():
+                    if "suspended" in text_content.lower():
                         return {"success": False, "error": "This Twitter / X account is suspended."}
-                    if "Failed to scan" in text_content or "deleted" in text_content.lower() or "not found" in text_content.lower():
+                    if any(s in text_content.lower() for s in ["failed to scan", "deleted", "not found"]):
                         return {"success": False, "error": "This tweet was deleted, private, or does not exist."}
                     continue
 
@@ -75,95 +71,136 @@ class TwitterDownloader:
                 except Exception:
                     continue
 
-                if not data.get("hasMedia") and not data.get("mediaURLs"):
-                    return {"success": False, "error": "This tweet contains no downloadable video or images."}
+                raw_items = []
+                text = ""
+                author = "Twitter User"
 
-                media_list = data.get("media_extended", [])
-                text = data.get("text", "")
-                author = f"{data.get('user_name', '')} (@{data.get('user_screen_name', '')})"
-                
-                downloaded_items = []
+                # 1. Handle FxTwitter structure: data = {"code": 200, "tweet": {...}}
+                if "tweet" in data and isinstance(data["tweet"], dict):
+                    tweet = data["tweet"]
+                    text = tweet.get("text", "")
+                    author_data = tweet.get("author") or {}
+                    author = f"{author_data.get('name', '')} (@{author_data.get('screen_name', '')})"
+                    media = tweet.get("media") or {}
+                    all_media = media.get("all") or media.get("videos") or media.get("photos") or []
+                    for m in all_media:
+                        m_type = m.get("type", "image")
+                        m_url = m.get("url")
+                        # If video has variants with multiple resolutions, pick best MP4 bitrate
+                        variants = m.get("variants") or []
+                        max_br = -1
+                        for v in variants:
+                            if v.get("content_type") == "video/mp4":
+                                br = v.get("bitrate", 0)
+                                if br > max_br and v.get("url"):
+                                    max_br = br
+                                    m_url = v.get("url")
 
-                if media_list:
-                    for idx, item in enumerate(media_list):
-                        m_type = item.get("type", "image")
-                        m_url = item.get("url")
-                        if not m_url:
-                            continue
-
-                        ext = ".mp4" if m_type in ["video", "gif"] else ".jpg"
-                        save_path = task_dir / f"twitter_{idx+1}{ext}"
-
-                        m_resp = requests.get(m_url, headers=headers, timeout=25)
-                        if m_resp.status_code == 200:
-                            save_path.write_bytes(m_resp.content)
-
-                            thumb_file = None
-                            dur_sec = None
-                            width = None
-                            height = None
-
-                            if m_type in ["video", "gif"]:
-                                thumb_url = item.get("thumbnail_url")
-                                if thumb_url:
-                                    try:
-                                        t_resp = requests.get(thumb_url, headers=headers, timeout=10)
-                                        if t_resp.status_code == 200 and len(t_resp.content) > 500:
-                                            t_path = task_dir / f"twitter_{idx+1}_thumb.jpg"
-                                            t_path.write_bytes(t_resp.content)
-                                            thumb_file = t_path
-                                    except Exception as e:
-                                        print(f"[Twitter thumb download error] {e}")
-
-                                dur_ms = item.get("duration_millis")
-                                if dur_ms:
-                                    dur_sec = int(dur_ms / 1000)
-                                size_dict = item.get("size") or {}
-                                width = size_dict.get("width")
-                                height = size_dict.get("height")
-
-                                # Fallback to ffprobe/ffmpeg if thumbnail or params missing
-                                if not thumb_file:
-                                    thumb_file = extract_thumbnail(save_path)
-                                if not dur_sec or not width or not height:
-                                    p_dur, p_w, p_h = get_video_params(save_path)
-                                    dur_sec = dur_sec or p_dur
-                                    width = width or p_w
-                                    height = height or p_h
-
-                            downloaded_items.append({
-                                "path": save_path,
+                        if m_url:
+                            raw_items.append({
                                 "type": m_type,
-                                "thumb": thumb_file,
-                                "duration": dur_sec,
-                                "width": width,
-                                "height": height,
+                                "url": m_url,
+                                "thumbnail_url": m.get("thumbnail_url"),
+                                "duration": int(float(m.get("duration", 0))),
+                                "width": m.get("width"),
+                                "height": m.get("height"),
                             })
-                elif data.get("mediaURLs"):
-                    for idx, m_url in enumerate(data["mediaURLs"]):
-                        is_video = any(ext in m_url for ext in [".mp4", "video."])
-                        ext = ".mp4" if is_video else ".jpg"
-                        save_path = task_dir / f"twitter_{idx+1}{ext}"
 
-                        m_resp = requests.get(m_url, headers=headers, timeout=25)
-                        if m_resp.status_code == 200:
-                            save_path.write_bytes(m_resp.content)
-                            thumb_file = None
-                            dur_sec = None
-                            width = None
-                            height = None
-                            if is_video:
-                                thumb_file = extract_thumbnail(save_path)
-                                dur_sec, width, height = get_video_params(save_path)
-
-                            downloaded_items.append({
-                                "path": save_path,
+                # 2. Handle VxTwitter structure: data = {"hasMedia": true, "media_extended": [...]}
+                elif data.get("hasMedia") or data.get("mediaURLs"):
+                    text = data.get("text", "")
+                    author = f"{data.get('user_name', '')} (@{data.get('user_screen_name', '')})"
+                    media_list = data.get("media_extended") or []
+                    if media_list:
+                        for m in media_list:
+                            m_type = m.get("type", "image")
+                            m_url = m.get("url")
+                            if m_url:
+                                dur_ms = m.get("duration_millis")
+                                dur_sec = int(dur_ms / 1000) if dur_ms else 0
+                                size_dict = m.get("size") or {}
+                                raw_items.append({
+                                    "type": m_type,
+                                    "url": m_url,
+                                    "thumbnail_url": m.get("thumbnail_url"),
+                                    "duration": dur_sec,
+                                    "width": size_dict.get("width"),
+                                    "height": size_dict.get("height"),
+                                })
+                    elif data.get("mediaURLs"):
+                        for m_url in data["mediaURLs"]:
+                            is_video = any(ext in m_url for ext in [".mp4", "video."])
+                            raw_items.append({
                                 "type": "video" if is_video else "image",
-                                "thumb": thumb_file,
-                                "duration": dur_sec,
-                                "width": width,
-                                "height": height,
+                                "url": m_url,
+                                "thumbnail_url": None,
+                                "duration": 0,
+                                "width": None,
+                                "height": None,
                             })
+
+                if not raw_items:
+                    continue
+
+                downloaded_items = []
+                for idx, item in enumerate(raw_items):
+                    m_type = item["type"]
+                    m_url = item["url"]
+                    ext = ".mp4" if m_type in ["video", "gif"] else ".jpg"
+                    save_path = task_dir / f"twitter_{idx+1}{ext}"
+
+                    # Chunked stream download to file (prevents VPS OOM!)
+                    try:
+                        with requests.get(m_url, headers=headers, stream=True, timeout=90) as m_resp:
+                            if m_resp.status_code == 200:
+                                with open(save_path, "wb") as f:
+                                    for chunk in m_resp.iter_content(chunk_size=1024 * 1024):
+                                        if chunk:
+                                            f.write(chunk)
+                    except Exception as e:
+                        print(f"[Twitter stream download error] {e}")
+                        continue
+
+                    if not save_path.exists() or save_path.stat().st_size == 0:
+                        continue
+
+                    thumb_file = None
+                    dur_sec = item.get("duration") or 0
+                    width = item.get("width")
+                    height = item.get("height")
+
+                    if m_type in ["video", "gif"]:
+                        thumb_url = item.get("thumbnail_url")
+                        if thumb_url:
+                            try:
+                                t_resp = requests.get(thumb_url, headers=headers, timeout=10)
+                                if t_resp.status_code == 200 and len(t_resp.content) > 200:
+                                    t_path = task_dir / f"twitter_{idx+1}_thumb.jpg"
+                                    t_path.write_bytes(t_resp.content)
+                                    if t_path.exists() and t_path.stat().st_size > 200:
+                                        thumb_file = t_path
+                            except Exception as e:
+                                print(f"[Twitter thumb download error] {e}")
+
+                        # Fallback to local frame extraction if thumbnail missing or invalid
+                        if not thumb_file or not thumb_file.exists():
+                            thumb_file = extract_thumbnail(save_path)
+
+                        # Fallback to ffprobe if duration or dimensions missing
+                        if not dur_sec or not width or not height:
+                            p_dur, p_w, p_h = get_video_params(save_path)
+                            dur_sec = dur_sec or p_dur
+                            width = width or p_w
+                            height = height or p_h
+
+                    downloaded_items.append({
+                        "path": save_path,
+                        "type": m_type,
+                        "thumb": thumb_file if (thumb_file and thumb_file.exists()) else None,
+                        "duration": dur_sec,
+                        "width": width,
+                        "height": height,
+                    })
 
                 if downloaded_items:
                     return {
@@ -209,7 +246,7 @@ class TwitterDownloader:
                                 downloaded.append({
                                     "path": f,
                                     "type": "video",
-                                    "thumb": thumb,
+                                    "thumb": thumb if (thumb and thumb.exists()) else None,
                                     "duration": dur,
                                     "width": w,
                                     "height": h,
@@ -222,7 +259,7 @@ class TwitterDownloader:
                                 downloaded.append({
                                     "path": f,
                                     "type": "gif",
-                                    "thumb": thumb,
+                                    "thumb": thumb if (thumb and thumb.exists()) else None,
                                     "duration": dur,
                                     "width": w,
                                     "height": h,

@@ -40,8 +40,8 @@ def purge_all_downloads():
             except Exception as e:
                 print(f"[Purge error] {e}")
 
-def purge_old_files(max_age_seconds: int = 120):
-    """Remove any temporary folders or files older than max_age_seconds."""
+def purge_old_files(max_age_seconds: int = 1800):
+    """Remove any orphaned temporary folders or files older than max_age_seconds (default 30 mins)."""
     now = time.time()
     if not DOWNLOAD_DIR.exists():
         return
@@ -58,11 +58,11 @@ def purge_old_files(max_age_seconds: int = 120):
             pass
 
 async def periodic_cleaner_task():
-    """Background garbage collector that purges stale files every 2 minutes."""
+    """Background garbage collector that purges stale orphaned files every 10 minutes."""
     while True:
         try:
-            await asyncio.sleep(120) # Every 2 minutes
-            purge_old_files(max_age_seconds=120)
+            await asyncio.sleep(600) # Every 10 minutes
+            purge_old_files(max_age_seconds=1800)
         except asyncio.CancelledError:
             break
         except Exception as e:
