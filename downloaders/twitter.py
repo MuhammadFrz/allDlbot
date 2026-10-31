@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
 import yt_dlp
 
 from utils.cleanup import create_task_dir
+from utils.converter import extract_thumbnail, get_video_params
 
 class TwitterDownloader:
     """Downloader for Twitter/X videos, GIFs, and single/multi-images."""
@@ -96,9 +97,47 @@ class TwitterDownloader:
                         m_resp = requests.get(m_url, headers=headers, timeout=25)
                         if m_resp.status_code == 200:
                             save_path.write_bytes(m_resp.content)
+
+                            thumb_file = None
+                            dur_sec = None
+                            width = None
+                            height = None
+
+                            if m_type in ["video", "gif"]:
+                                thumb_url = item.get("thumbnail_url")
+                                if thumb_url:
+                                    try:
+                                        t_resp = requests.get(thumb_url, headers=headers, timeout=10)
+                                        if t_resp.status_code == 200 and len(t_resp.content) > 500:
+                                            t_path = task_dir / f"twitter_{idx+1}_thumb.jpg"
+                                            t_path.write_bytes(t_resp.content)
+                                            thumb_file = t_path
+                                    except Exception as e:
+                                        print(f"[Twitter thumb download error] {e}")
+
+                                dur_ms = item.get("duration_millis")
+                                if dur_ms:
+                                    dur_sec = int(dur_ms / 1000)
+                                size_dict = item.get("size") or {}
+                                width = size_dict.get("width")
+                                height = size_dict.get("height")
+
+                                # Fallback to ffprobe/ffmpeg if thumbnail or params missing
+                                if not thumb_file:
+                                    thumb_file = extract_thumbnail(save_path)
+                                if not dur_sec or not width or not height:
+                                    p_dur, p_w, p_h = get_video_params(save_path)
+                                    dur_sec = dur_sec or p_dur
+                                    width = width or p_w
+                                    height = height or p_h
+
                             downloaded_items.append({
                                 "path": save_path,
                                 "type": m_type,
+                                "thumb": thumb_file,
+                                "duration": dur_sec,
+                                "width": width,
+                                "height": height,
                             })
                 elif data.get("mediaURLs"):
                     for idx, m_url in enumerate(data["mediaURLs"]):
@@ -109,9 +148,21 @@ class TwitterDownloader:
                         m_resp = requests.get(m_url, headers=headers, timeout=25)
                         if m_resp.status_code == 200:
                             save_path.write_bytes(m_resp.content)
+                            thumb_file = None
+                            dur_sec = None
+                            width = None
+                            height = None
+                            if is_video:
+                                thumb_file = extract_thumbnail(save_path)
+                                dur_sec, width, height = get_video_params(save_path)
+
                             downloaded_items.append({
                                 "path": save_path,
                                 "type": "video" if is_video else "image",
+                                "thumb": thumb_file,
+                                "duration": dur_sec,
+                                "width": width,
+                                "height": height,
                             })
 
                 if downloaded_items:
@@ -153,11 +204,29 @@ class TwitterDownloader:
                         if f.is_file():
                             ext = f.suffix.lower()
                             if ext in [".mp4", ".mkv", ".webm"]:
-                                downloaded.append({"path": f, "type": "video"})
+                                thumb = extract_thumbnail(f)
+                                dur, w, h = get_video_params(f)
+                                downloaded.append({
+                                    "path": f,
+                                    "type": "video",
+                                    "thumb": thumb,
+                                    "duration": dur,
+                                    "width": w,
+                                    "height": h,
+                                })
                             elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
                                 downloaded.append({"path": f, "type": "image"})
                             elif ext in [".gif"]:
-                                downloaded.append({"path": f, "type": "gif"})
+                                thumb = extract_thumbnail(f)
+                                dur, w, h = get_video_params(f)
+                                downloaded.append({
+                                    "path": f,
+                                    "type": "gif",
+                                    "thumb": thumb,
+                                    "duration": dur,
+                                    "width": w,
+                                    "height": h,
+                                })
 
                     if downloaded:
                         return {

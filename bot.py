@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from telethon import TelegramClient, events, Button
-from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
+from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio, DocumentAttributeAnimated
 
 import config
 from utils.cleanup import (
@@ -19,7 +19,7 @@ from utils.cleanup import (
 )
 from utils.progress import TelegramProgress, human_bytes, create_bar
 from utils.detector import extract_url, detect_platform
-from utils.converter import video_to_mp3, video_to_gif, convert_video_quality, extract_thumbnail, convert_file_format
+from utils.converter import video_to_mp3, video_to_gif, convert_video_quality, extract_thumbnail, convert_file_format, get_video_params
 from downloaders import (
     YouTubeDownloader,
     InstagramDownloader,
@@ -32,6 +32,7 @@ from downloaders import (
     FacebookDownloader,
     GooglePlayDownloader,
     DirectDownloader,
+    SxyprnDownloader,
 )
 
 # Setup Logging
@@ -58,6 +59,57 @@ def get_audio_duration_seconds(file_path: Path) -> int:
         return int(audio.info.length)
     except Exception:
         return 0
+
+def prepare_video_attributes(
+    video_path: Path,
+    thumb_path: Optional[Path] = None,
+    duration: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    is_gif: bool = False,
+):
+    """
+    Prepare DocumentAttributeVideo/Animated and thumbnail path for Telethon send_file.
+    Ensures video uploads display with correct duration, thumbnail preview, and dimensions.
+    """
+    if not duration or not width or not height:
+        p_dur, p_w, p_h = get_video_params(video_path)
+        duration = duration or p_dur
+        width = width or p_w
+        height = height or p_h
+
+    duration = int(duration or 0)
+    width = int(width or 1280)
+    height = int(height or 720)
+
+    if not thumb_path or not Path(thumb_path).exists():
+        thumb_path = extract_thumbnail(video_path)
+
+    attrs = []
+    if is_gif:
+        attrs.append(DocumentAttributeAnimated())
+        attrs.append(
+            DocumentAttributeVideo(
+                duration=duration,
+                w=width,
+                h=height,
+                supports_streaming=True,
+                nosound=True,
+            )
+        )
+    else:
+        attrs.append(
+            DocumentAttributeVideo(
+                duration=duration,
+                w=width,
+                h=height,
+                supports_streaming=True,
+            )
+        )
+
+    final_thumb = thumb_path if (thumb_path and Path(thumb_path).exists()) else None
+    return attrs, final_thumb
+
 
 def make_cancel_button(task_id: str):
     """Return inline cancel button for any active task."""
@@ -107,6 +159,9 @@ PLATFORM_INLINE_BUTTONS = [
         Button.inline("🔄 Media Converter", data=b"plat:converter"),
         Button.inline("🔗 Direct Links", data=b"plat:direct"),
     ],
+    [
+        Button.inline("🔞 SXYPRN", data=b"plat:sxyprn"),
+    ],
 ]
 
 
@@ -127,7 +182,8 @@ async def start_handler(event):
         "• ☁️ **SoundCloud**: 320kbps MP3 with 500x500 Cover Art & Tags\n"
         "• 📘 **Facebook**: High Quality Reels & Watch Videos\n"
         "• 🔗 **Direct Links**: Download files, videos, music, PDFs, APKs, & archives directly\n"
-        "• 🔄 **Media Converter**: Convert any video to MP3, GIF, or change resolution!\n\n"
+        "• 🔄 **Media Converter**: Convert any video to MP3, GIF, or change resolution!\n"
+        "• 🔞 **SXYPRN**: Direct HD video downloads from sxyprn.com\n\n"
         "👇 **Tap a platform below to learn more, or paste your link directly:**"
     )
     await event.respond(welcome_text, buttons=MAIN_KEYBOARD, parse_mode="md")
@@ -150,6 +206,7 @@ async def download_menu_button(event):
         "• `reddit.com/...` or `redd.it/...` (Videos with sound & galleries)\n"
         "• `soundcloud.com/...` (320kbps MP3 with cover artwork)\n"
         "• `facebook.com/...` or `fb.watch/...` (Reels & Watch videos)\n"
+        "• `sxyprn.com/post/...` (HD Video downloads)\n"
         "• **Direct Links**: Any `http://` or `https://` direct file download link\n\n"
         "👇 **Paste your link here now:**"
     )
@@ -295,6 +352,13 @@ async def platform_info_callback(event):
             "• **Smart Streaming**: Automatic media player integration, thumbnail generation, and audio player tagging.\n"
             "• **Speed**: Fast multi-threaded streaming up to 2GB per file.\n\n"
             "💡 *Paste any direct file link to start downloading!*"
+        ),
+        "sxyprn": (
+            "🔞 **SXYPRN Downloader**\n\n"
+            "• **HD Video**: Downloads the highest quality MP4 directly.\n"
+            "• **Auto-extraction**: Parses embedded player config to get the real CDN link.\n"
+            "• **Fallback**: yt-dlp generic extractor if direct scrape fails.\n\n"
+            "💡 *Paste any `sxyprn.com/post/...` link to try it!*"
         ),
     }
 
@@ -515,6 +579,58 @@ async def message_handler(event):
         task_id = uuid.uuid4().hex[:8]
         t = asyncio.create_task(run_direct_job(event, normalized_url, task_id))
         active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "sxyprn":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(run_sxyprn_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+
+
+# -------------------------------------------------------------
+# SXYPRN Job
+# -------------------------------------------------------------
+async def run_sxyprn_job(event, url: str, task_id: str):
+    task_dir = create_task_dir(task_id)
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.reply(
+        "⏳ **Fetching SXYPRN video...**",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            res = await SxyprnDownloader.download(url, task_dir)
+            if not res.get("success") or not res.get("path"):
+                await status_msg.edit(f"❌ **{res.get('error', 'Could not download this SXYPRN video.')}**")
+                return
+
+            vid_path = res["path"]
+            title = res.get("title", "SXYPRN Video")
+            caption = f"🔞 **SXYPRN**\n\n{title}".strip()
+
+            attrs, thumb = prepare_video_attributes(vid_path)
+            progress = TelegramProgress(status_msg, action="Uploading SXYPRN video", buttons=make_cancel_button(task_id))
+            await client.send_file(
+                event.chat_id,
+                vid_path,
+                caption=caption,
+                thumb=thumb,
+                attributes=attrs,
+                supports_streaming=True,
+                progress_callback=progress.callback,
+            )
+
+            await status_msg.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"SXYPRN job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"SXYPRN error: {e}")
+        await status_msg.edit(f"❌ **Error downloading SXYPRN video:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
 
 
 # -------------------------------------------------------------
@@ -854,12 +970,17 @@ async def run_instagram_job(event, url: str, task_id: str):
             file_paths = [item["path"] for item in media_items]
 
             if len(file_paths) == 1:
+                item_path = file_paths[0]
+                is_vid = item_path.suffix.lower() in [".mp4", ".mkv", ".webm", ".mov"]
+                attrs, thumb = prepare_video_attributes(item_path) if is_vid else (None, None)
                 progress = TelegramProgress(status_msg, action="Uploading", buttons=make_cancel_button(task_id))
                 await client.send_file(
                     event.chat_id,
-                    file_paths[0],
+                    item_path,
                     caption=full_caption,
-                    supports_streaming=True,
+                    thumb=thumb,
+                    attributes=attrs,
+                    supports_streaming=is_vid,
                     progress_callback=progress.callback,
                 )
             else:
@@ -930,11 +1051,14 @@ async def run_tiktok_job(event, url: str, task_id: str):
                     )
             else:
                 vid_file = media_files[0]
+                attrs, thumb = prepare_video_attributes(vid_file)
                 progress = TelegramProgress(status_msg, action="Uploading TikTok video", buttons=make_cancel_button(task_id))
                 await client.send_file(
                     event.chat_id,
                     vid_file,
                     caption=caption,
+                    thumb=thumb,
+                    attributes=attrs,
                     supports_streaming=True,
                     progress_callback=progress.callback,
                 )
@@ -990,11 +1114,23 @@ async def run_twitter_job(event, url: str, task_id: str):
             if len(items) == 1:
                 item = items[0]
                 progress = TelegramProgress(status_msg, action="Uploading", buttons=make_cancel_button(task_id))
-                if item["type"] == "gif":
+                if item["type"] in ["video", "gif"]:
+                    is_gif = (item["type"] == "gif")
+                    attrs, thumb = prepare_video_attributes(
+                        item["path"],
+                        thumb_path=item.get("thumb"),
+                        duration=item.get("duration"),
+                        width=item.get("width"),
+                        height=item.get("height"),
+                        is_gif=is_gif,
+                    )
                     await client.send_file(
                         event.chat_id,
                         item["path"],
                         caption=full_caption,
+                        thumb=thumb,
+                        attributes=attrs,
+                        supports_streaming=True,
                         progress_callback=progress.callback,
                     )
                 else:
@@ -1002,7 +1138,6 @@ async def run_twitter_job(event, url: str, task_id: str):
                         event.chat_id,
                         item["path"],
                         caption=full_caption,
-                        supports_streaming=(item["type"] == "video"),
                         progress_callback=progress.callback,
                     )
             elif all_images:
@@ -1014,12 +1149,30 @@ async def run_twitter_job(event, url: str, task_id: str):
             else:
                 for idx, it in enumerate(items):
                     c_text = full_caption if idx == 0 else ""
-                    await client.send_file(
-                        event.chat_id,
-                        it["path"],
-                        caption=c_text,
-                        supports_streaming=(it["type"] == "video"),
-                    )
+                    if it["type"] in ["video", "gif"]:
+                        is_gif = (it["type"] == "gif")
+                        attrs, thumb = prepare_video_attributes(
+                            it["path"],
+                            thumb_path=it.get("thumb"),
+                            duration=it.get("duration"),
+                            width=it.get("width"),
+                            height=it.get("height"),
+                            is_gif=is_gif,
+                        )
+                        await client.send_file(
+                            event.chat_id,
+                            it["path"],
+                            caption=c_text,
+                            thumb=thumb,
+                            attributes=attrs,
+                            supports_streaming=True,
+                        )
+                    else:
+                        await client.send_file(
+                            event.chat_id,
+                            it["path"],
+                            caption=c_text,
+                        )
 
             await status_msg.delete()
 
@@ -1110,10 +1263,13 @@ async def run_pinterest_job(event, url: str, task_id: str):
 
             progress = TelegramProgress(status_msg, action="Uploading to Telegram", buttons=make_cancel_button(task_id))
             if media_type == "video":
+                attrs, thumb = prepare_video_attributes(file_path)
                 await client.send_file(
                     event.chat_id,
                     file_path,
                     caption=caption,
+                    thumb=thumb,
+                    attributes=attrs,
                     supports_streaming=True,
                     progress_callback=progress.callback,
                 )
@@ -1166,12 +1322,16 @@ async def run_reddit_job(event, url: str, task_id: str):
 
             if len(items) == 1:
                 it = items[0]
+                is_vid = (it.get("type") == "video")
+                attrs, thumb = prepare_video_attributes(it["path"]) if is_vid else (None, None)
                 progress = TelegramProgress(status_msg, action="Uploading", buttons=make_cancel_button(task_id))
                 await client.send_file(
                     event.chat_id,
                     it["path"],
                     caption=caption,
-                    supports_streaming=(it.get("type") == "video"),
+                    thumb=thumb,
+                    attributes=attrs,
+                    supports_streaming=is_vid,
                     progress_callback=progress.callback,
                 )
             else:
@@ -1269,11 +1429,14 @@ async def run_facebook_job(event, url: str, task_id: str):
             author = res.get("author", "Facebook")
             caption = f"📘 **Facebook by {author}**\n\n{title}".strip()
 
+            attrs, thumb = prepare_video_attributes(vid_path)
             progress = TelegramProgress(status_msg, action="Uploading Facebook video", buttons=make_cancel_button(task_id))
             await client.send_file(
                 event.chat_id,
                 vid_path,
                 caption=caption,
+                thumb=thumb,
+                attributes=attrs,
                 supports_streaming=True,
                 progress_callback=progress.callback,
             )
@@ -1354,11 +1517,13 @@ async def run_direct_job(event, url: str, task_id: str):
 
             if file_type == "video":
                 caption = f"🎬 **{filename}**\n📊 Size: `{size_str}`"
+                attrs, thumb = prepare_video_attributes(file_path, thumb_path=thumb)
                 await client.send_file(
                     event.chat_id,
                     file_path,
                     caption=caption,
-                    thumb=thumb if thumb and thumb.exists() else None,
+                    thumb=thumb,
+                    attributes=attrs,
                     supports_streaming=True,
                     progress_callback=progress.callback,
                 )

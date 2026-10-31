@@ -25,30 +25,93 @@ def get_video_duration(input_path: Path) -> float:
     """Return duration of video in seconds."""
     info = get_media_info(input_path)
     try:
-        return float(info.get("format", {}).get("duration", 0))
+        dur = float(info.get("format", {}).get("duration", 0))
+        if dur > 0:
+            return dur
     except (ValueError, TypeError):
-        return 0.0
+        pass
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "video":
+            try:
+                dur = float(s.get("duration", 0))
+                if dur > 0:
+                    return dur
+            except (ValueError, TypeError):
+                pass
+    return 0.0
 
-def extract_thumbnail(video_path: Path, output_thumb: Optional[Path] = None) -> Optional[Path]:
-    """Extract a frame from video as JPEG thumbnail."""
+def get_video_params(input_path: Path) -> Tuple[int, int, int]:
+    """
+    Return (duration_seconds, width, height) of video using ffprobe.
+    Handles rotated videos properly (e.g. mobile portrait videos).
+    """
+    info = get_media_info(input_path)
+    duration = 0
+    width = 0
+    height = 0
+    try:
+        format_info = info.get("format", {})
+        duration = int(float(format_info.get("duration", 0)))
+    except (ValueError, TypeError):
+        pass
+
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "video":
+            if not duration:
+                try:
+                    duration = int(float(s.get("duration", 0)))
+                except (ValueError, TypeError):
+                    pass
+            w = s.get("width")
+            h = s.get("height")
+            if w and h:
+                # Check for rotation tag or side_data
+                rotation = 0
+                tags = s.get("tags") or {}
+                if "rotate" in tags:
+                    try:
+                        rotation = int(tags["rotate"])
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    for side_data in s.get("side_data_list", []):
+                        if "rotation" in side_data:
+                            try:
+                                rotation = int(side_data["rotation"])
+                            except (ValueError, TypeError):
+                                pass
+                if abs(rotation) in (90, 270):
+                    w, h = h, w
+                width = int(w)
+                height = int(h)
+                break
+
+    return duration, width, height
+
+def extract_thumbnail(video_path: Path, output_thumb: Optional[Path] = None, timestamp: str = "00:00:01") -> Optional[Path]:
+    """Extract a frame from video as JPEG thumbnail scaled for Telegram preview."""
     if output_thumb is None:
         output_thumb = video_path.with_suffix(".thumb.jpg")
     
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", "00:00:01",
-        "-i", str(video_path),
-        "-vframes", "1",
-        "-q:v", "2",
-        str(output_thumb)
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, check=True)
-        if output_thumb.exists():
-            return output_thumb
-    except Exception as e:
-        print(f"[Extract Thumbnail Error] {e}")
-    return None
+    # Try preferred timestamp, then fallback to earlier positions for short clips
+    for ss in [timestamp, "00:00:00.1", "00:00:00"]:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", ss,
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-vf", "scale=min(320\\,iw):-2",
+            "-q:v", "2",
+            str(output_thumb)
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True)
+            if res.returncode == 0 and output_thumb.exists() and output_thumb.stat().st_size > 200:
+                return output_thumb
+        except Exception as e:
+            print(f"[Extract Thumbnail Error on {ss}] {e}")
+
+    return output_thumb if output_thumb.exists() and output_thumb.stat().st_size > 200 else None
 
 def video_to_mp3(input_path: Path, output_path: Optional[Path] = None, bitrate: str = "320k") -> Optional[Path]:
     """Convert any video or audio file to MP3."""
