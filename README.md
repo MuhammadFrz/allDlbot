@@ -5,7 +5,7 @@
 [![FFmpeg](https://img.shields.io/badge/multimedia-FFmpeg-green.svg)](https://ffmpeg.org/)
 [![Status](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 
-An advanced, asynchronous Telegram Bot built with Python and Telethon (MTProto) that downloads and converts media from **TikTok, Instagram, Twitter / X, Spotify, YouTube, Google Play Store (APKs), Pinterest, Reddit, SoundCloud, and Facebook** directly inside Telegram with **zero slash commands required**.
+An advanced, asynchronous Telegram Bot built with Python and Telethon (MTProto) that downloads and converts media from **TikTok, Instagram, Twitter / X, Spotify, YouTube, Google Play Store (APKs), Pinterest, Reddit, SoundCloud, Facebook, direct web links, and adult content websites** directly inside Telegram with **zero slash commands required**.
 
 Designed with a **button-first interface**, **interactive cancellation on all tasks**, and a strict **zero-waste server storage policy** with no disk caching.
 
@@ -71,11 +71,22 @@ Designed with a **button-first interface**, **interactive cancellation on all ta
 - **Public Posts**: High definition 1080p/720p downloads.
 - Supports `facebook.com` and `fb.watch` shortlinks.
 
-### 🔄 11. Built-in Media Converter & Video Tools
-- Send or forward **any video file** directly to the bot:
-  - 🎵 **Extract MP3 Audio**: 320kbps high-quality audio extraction.
-  - 🎞️ **Convert to GIF**: 2-pass palette-generated high-fidelity animated GIF.
-  - 🎬 **Change Resolution**: Fast re-encoding to 720p, 480p, or 360p.
+### 🔞 11. Adult Content Websites
+- **Dynamic Quality Selector**: Interactive resolution selection based on available streams (4K, 2K, 1080p FHD, 720p HD, 480p SD, 360p, 240p).
+- **Audio Extraction**: Direct 320kbps MP3 audio extraction with embedded thumbnails.
+- **Rich Metadata & Previews**: Preserves original titles, durations, uploader details, and high-quality video thumbnails.
+- **Geo-Block & Anti-Bot Protection**: Seamless routing to bypass regional restrictions, state-level age verification blocks, and verification challenges.
+
+### 🌐 12. Direct File Downloader
+- **Arbitrary HTTP/HTTPS URLs**: Send any direct file link to download and forward it directly as a Telegram document.
+- **Smart Filename Detection**: Automatically extracts file names from `Content-Disposition` headers or URL paths.
+- **Interactive Progress & Cancel**: Real-time download progress bar with live cancellation support.
+
+### 🔄 13. File Rename, Format Conversion & Media Tools
+- **File Renaming**: Send or forward any file or document to quickly rename it with customized extensions.
+- **Video Conversion**: High-speed re-encoding to 1080p, 720p, 480p, or 360p.
+- **Audio Extraction**: Convert any video file into a 320kbps MP3.
+- **Animated GIF Creator**: High-fidelity 2-pass palette-generated GIF conversion.
 
 ---
 
@@ -131,11 +142,14 @@ allDlbot/
 │   ├── pinterest.py         # Pinterest original images & HD video pins
 │   ├── reddit.py            # Reddit video+audio muxer & galleries
 │   ├── soundcloud.py        # SoundCloud 320kbps MP3 & 500x500 cover art
-│   └── facebook.py          # Facebook reels & watch videos
+│   ├── facebook.py          # Facebook reels & watch videos
+│   ├── direct.py            # Direct HTTP/HTTPS file downloader
+│   ├── pornhub.py           # Adult content downloader & quality selector
+│   └── sxyprn.py            # Adult content video extractor
 ├── utils/
 │   ├── __init__.py
 │   ├── converter.py         # FFmpeg video-to-audio, GIF, and resolution scaler
-│   ├── detector.py          # URL parser and platform router (10 platforms)
+│   ├── detector.py          # URL parser and multi-platform router
 │   ├── progress.py          # Throttled upload progress bar with cancel button
 │   └── cleanup.py           # Directory lifecycle, disk purger, garbage collector
 └── deploy/
