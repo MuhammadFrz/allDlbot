@@ -15,6 +15,7 @@ PLATFORM_PATTERNS = {
     "facebook": re.compile(r'(?:(?:www|m|web)\.)?(?:facebook\.com/(?:watch\?|reel/|reels/|.*[?&]v=|share/|videos/|story\.php|permalink\.php)|fb\.watch/|fb\.com/)', re.IGNORECASE),
     "googleplay": re.compile(r'(?:(?:play\.google\.com/store/apps/details\?|market://details\?)|(?:[a-z]{2,}\.)?google\.com/store/apps/details\?)', re.IGNORECASE),
     "sxyprn": re.compile(r'sxyprn\.com/(?:post|video|watch)/[^\s]+', re.IGNORECASE),
+    "pornhub": re.compile(r'(?:pornhub(?:premium)?\.(?:com|net|org)/(?:view_video\.php\?viewkey=|embed/|video/show\?viewkey=)|thumbzilla\.com/video/)[a-zA-Z0-9_-]+', re.IGNORECASE),
 }
 
 def extract_url(text: str) -> Optional[str]:

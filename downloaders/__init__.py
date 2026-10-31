@@ -10,6 +10,7 @@ from .facebook import FacebookDownloader
 from .googleplay import GooglePlayDownloader
 from .direct import DirectDownloader
 from .sxyprn import SxyprnDownloader
+from .pornhub import PornhubDownloader
 
 __all__ = [
     "YouTubeDownloader",
@@ -24,4 +25,5 @@ __all__ = [
     "GooglePlayDownloader",
     "DirectDownloader",
     "SxyprnDownloader",
+    "PornhubDownloader",
 ]

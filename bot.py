@@ -33,6 +33,7 @@ from downloaders import (
     GooglePlayDownloader,
     DirectDownloader,
     SxyprnDownloader,
+    PornhubDownloader,
 )
 
 # Setup Logging
@@ -44,6 +45,7 @@ logger = logging.getLogger("AllDLBot")
 
 # In-memory storage for active download tasks and pending menus
 pending_yt_tasks: Dict[str, Dict[str, Any]] = {}
+pending_ph_tasks: Dict[str, Dict[str, Any]] = {}
 pending_gplay_tasks: Dict[str, Dict[str, Any]] = {}
 pending_file_ops: Dict[str, Dict[str, Any]] = {}
 waiting_rename_tasks: Dict[int, str] = {}
@@ -161,6 +163,7 @@ PLATFORM_INLINE_BUTTONS = [
     ],
     [
         Button.inline("🔞 SXYPRN", data=b"plat:sxyprn"),
+        Button.inline("🔞 Pornhub", data=b"plat:pornhub"),
     ],
 ]
 
@@ -183,7 +186,8 @@ async def start_handler(event):
         "• 📘 **Facebook**: High Quality Reels & Watch Videos\n"
         "• 🔗 **Direct Links**: Download files, videos, music, PDFs, APKs, & archives directly\n"
         "• 🔄 **Media Converter**: Convert any video to MP3, GIF, or change resolution!\n"
-        "• 🔞 **SXYPRN**: Direct HD video downloads from sxyprn.com\n\n"
+        "• 🔞 **SXYPRN**: Direct HD video downloads from sxyprn.com\n"
+        "• 🔞 **Pornhub**: HD Videos with quality selector (1080p, 720p, etc.) & MP3\n\n"
         "👇 **Tap a platform below to learn more, or paste your link directly:**"
     )
     await event.respond(welcome_text, buttons=MAIN_KEYBOARD, parse_mode="md")
@@ -207,6 +211,7 @@ async def download_menu_button(event):
         "• `soundcloud.com/...` (320kbps MP3 with cover artwork)\n"
         "• `facebook.com/...` or `fb.watch/...` (Reels & Watch videos)\n"
         "• `sxyprn.com/post/...` (HD Video downloads)\n"
+        "• `pornhub.com/view_video.php?...` (Quality selector & MP3)\n"
         "• **Direct Links**: Any `http://` or `https://` direct file download link\n\n"
         "👇 **Paste your link here now:**"
     )
@@ -353,6 +358,14 @@ async def platform_info_callback(event):
             "• **Speed**: Fast multi-threaded streaming up to 2GB per file.\n\n"
             "💡 *Paste any direct file link to start downloading!*"
         ),
+        "pornhub": (
+            "🔞 **Pornhub Downloader**\n\n"
+            "• **Available Quality Selector**: Automatically detects all resolutions offered (1080p FHD, 720p HD, 480p SD, 240p Low).\n"
+            "• **High Quality MP3**: Direct 320kbps audio extraction.\n"
+            "• **Full Metadata**: Video title, uploader/performer, duration, and thumbnail preview.\n"
+            "• Works with `pornhub.com`, `pornhubpremium.com`, and `thumbzilla.com`.\n\n"
+            "💡 *Paste any Pornhub link to try it!*"
+        ),
         "sxyprn": (
             "🔞 **SXYPRN Downloader**\n\n"
             "• **HD Video**: Downloads the highest quality MP4 directly.\n"
@@ -399,6 +412,13 @@ async def cancel_job_callback(event):
         await event.edit("❌ **Download cancelled.** Temporary files purged from server.")
     else:
         await event.edit("❌ **Task already finished or cancelled.**")
+
+
+@client.on(events.CallbackQuery(pattern=r"^cancel_ph:(.+)$"))
+async def cancel_ph_callback(event):
+    video_id = event.pattern_match.group(1).decode("utf-8")
+    pending_ph_tasks.pop(video_id, None)
+    await event.edit("❌ **Operation cancelled.**")
 
 
 @client.on(events.CallbackQuery(pattern=r"^cancel:(.+)$"))
@@ -582,6 +602,10 @@ async def message_handler(event):
     elif platform == "sxyprn":
         task_id = uuid.uuid4().hex[:8]
         t = asyncio.create_task(run_sxyprn_job(event, normalized_url, task_id))
+        active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+    elif platform == "pornhub":
+        task_id = uuid.uuid4().hex[:8]
+        t = asyncio.create_task(handle_pornhub_request(event, normalized_url, task_id))
         active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
 
 
@@ -787,6 +811,160 @@ async def run_googleplay_job(event, task_info: Dict[str, Any], arch: str, task_i
         logger.info(f"Google Play job {task_id} cancelled by user.")
     except Exception as e:
         logger.error(f"Google Play download/upload error: {e}")
+        await event.edit(f"❌ **Error:** {str(e)}")
+    finally:
+        cleanup_dir(task_dir)
+        active_jobs.pop(task_id, None)
+
+
+# -------------------------------------------------------------
+# Pornhub Handler & Quality Selector
+# -------------------------------------------------------------
+async def handle_pornhub_request(event, url: str, task_id: str):
+    status_msg = await event.reply("🔍 **Fetching Pornhub video information...**", buttons=make_cancel_button(task_id))
+
+    try:
+        info = await asyncio.to_thread(PornhubDownloader.get_info, url)
+        if not info:
+            await status_msg.edit("❌ **Could not retrieve video details.** Please verify the link is public.")
+            return
+
+        video_id = info["id"]
+        pending_ph_tasks[video_id] = {
+            "url": url,
+            "title": info["title"],
+            "duration": info["duration"],
+            "uploader": info["uploader"],
+        }
+
+        dur_mins = f"{info['duration']//60}:{info['duration']%60:02d}" if info.get("duration") else "N/A"
+        caption = (
+            f"🔞 **{info['title']}**\n\n"
+            f"👤 **Uploader:** `{info['uploader']}`\n"
+            f"⏱️ **Duration:** `{dur_mins}`\n\n"
+            f"👉 **Tap a button to choose your preferred quality:**"
+        )
+
+        labels = {
+            2160: "🎬 4K UHD",
+            1440: "🎬 2K QHD",
+            1080: "🎬 1080p FHD",
+            720: "🎬 720p HD",
+            480: "🎬 480p SD",
+            360: "🎬 360p Low",
+            240: "🎬 240p Mini",
+        }
+
+        available = info.get("available_heights") or []
+        buttons = []
+        current_row = []
+
+        if available:
+            for h in available:
+                lbl = labels.get(h, f"🎬 {h}p")
+                current_row.append(Button.inline(lbl, data=f"ph:{h}:{video_id}"))
+                if len(current_row) == 2:
+                    buttons.append(current_row)
+                    current_row = []
+            if current_row:
+                buttons.append(current_row)
+        else:
+            buttons.append([
+                Button.inline("🎬 Best Quality", data=f"ph:best:{video_id}"),
+                Button.inline("🎬 720p HD", data=f"ph:720:{video_id}"),
+            ])
+
+        buttons.append([
+            Button.inline("🎵 Audio (MP3 320k)", data=f"ph:mp3:{video_id}"),
+        ])
+        buttons.append([Button.inline("❌ Cancel", data=f"cancel_ph:{video_id}")])
+
+        await status_msg.edit(caption, buttons=buttons)
+    except asyncio.CancelledError:
+        await status_msg.edit("❌ **Cancelled by user.**")
+    except Exception as e:
+        await status_msg.edit(f"❌ **Error:** {str(e)}")
+    finally:
+        active_jobs.pop(task_id, None)
+
+
+@client.on(events.CallbackQuery(pattern=r"^ph:(.+):(.+)$"))
+async def pornhub_callback(event):
+    quality = event.pattern_match.group(1).decode("utf-8")
+    video_id = event.pattern_match.group(2).decode("utf-8")
+
+    task = pending_ph_tasks.get(video_id)
+    if not task:
+        await event.answer("Task expired. Please re-send the Pornhub link.", alert=True)
+        return
+
+    task_id = uuid.uuid4().hex[:8]
+    t = asyncio.create_task(run_pornhub_job(event, task, quality, task_id))
+    active_jobs[task_id] = {"task": t, "chat_id": event.chat_id}
+
+
+async def run_pornhub_job(event, task: Dict[str, Any], quality: str, task_id: str):
+    url = task["url"]
+    label = "Audio MP3" if quality == "mp3" else ("Best" if quality == "best" else f"{quality}p")
+    task_dir = create_task_dir(task_id)
+
+    if task_id in active_jobs:
+        active_jobs[task_id]["task_dir"] = task_dir
+
+    status_msg = await event.edit(
+        f"⏳ **Downloading Pornhub ({label})...**\nPlease wait.",
+        buttons=make_cancel_button(task_id)
+    )
+
+    try:
+        async with active_semaphore:
+            media_path, thumb_path, meta = await asyncio.to_thread(
+                PornhubDownloader.download, url, quality, task_dir
+            )
+
+            if not media_path or not media_path.exists():
+                await event.edit(f"❌ **Download failed:** {meta.get('error', 'Unknown error')}")
+                return
+
+            progress = TelegramProgress(event, action=f"Uploading Pornhub ({label})", buttons=make_cancel_button(task_id))
+            title = meta.get("title", task.get("title", "Pornhub Video"))
+            uploader = meta.get("uploader", task.get("uploader", "Pornhub"))
+            caption = f"🔞 **{title}**\n👤 Uploader: `{uploader}`"
+
+            if quality == "mp3":
+                dur = int(meta.get("duration", 0) or get_audio_duration_seconds(media_path))
+                await client.send_file(
+                    event.chat_id,
+                    media_path,
+                    caption=caption,
+                    thumb=thumb_path if (thumb_path and thumb_path.exists()) else None,
+                    attributes=[DocumentAttributeAudio(duration=dur, title=title, performer=uploader)],
+                    progress_callback=progress.callback,
+                )
+            else:
+                attrs, thumb = prepare_video_attributes(
+                    media_path,
+                    thumb_path=thumb_path,
+                    duration=meta.get("duration"),
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                )
+                await client.send_file(
+                    event.chat_id,
+                    media_path,
+                    caption=caption,
+                    thumb=thumb,
+                    attributes=attrs,
+                    supports_streaming=True,
+                    progress_callback=progress.callback,
+                )
+
+            await event.delete()
+
+    except asyncio.CancelledError:
+        logger.info(f"Pornhub job {task_id} cancelled by user.")
+    except Exception as e:
+        logger.error(f"Pornhub download/upload error: {e}")
         await event.edit(f"❌ **Error:** {str(e)}")
     finally:
         cleanup_dir(task_dir)
