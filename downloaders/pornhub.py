@@ -1,5 +1,6 @@
 import os
 import asyncio
+import socket
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import yt_dlp
@@ -20,16 +21,43 @@ class PornhubDownloader:
     }
 
     @staticmethod
-    def get_info(url: str) -> Optional[Dict[str, Any]]:
+    def get_proxy() -> Optional[str]:
+        """
+        Detect configured proxy or local Tor SOCKS proxy.
+        Tor is used to bypass regional/US-state restrictions (e.g. Missouri/Kansas age-verification blocks).
+        """
+        env_proxy = os.getenv("PORNHUB_PROXY")
+        if env_proxy:
+            return env_proxy
+
+        # Check if local Tor daemon is running on 127.0.0.1:9050
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1", 9050))
+            s.close()
+            return "socks5h://127.0.0.1:9050"
+        except Exception:
+            pass
+
+        return None
+
+    @classmethod
+    def get_info(cls, url: str) -> Optional[Dict[str, Any]]:
         """Fetch metadata without downloading video."""
+        proxy = cls.get_proxy()
+
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "cachedir": False,
             "no_cache_dir": True,
-            "http_headers": PornhubDownloader.HEADERS,
+            "http_headers": cls.HEADERS,
         }
+        if proxy:
+            ydl_opts["proxy"] = proxy
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
@@ -58,8 +86,9 @@ class PornhubDownloader:
                 print(f"[Pornhub info error] {e}")
                 return None
 
-    @staticmethod
+    @classmethod
     def download(
+        cls,
         url: str,
         quality: str = "720",
         task_dir: Optional[Path] = None,
@@ -71,6 +100,7 @@ class PornhubDownloader:
         if task_dir is None:
             task_dir = create_task_dir()
 
+        proxy = cls.get_proxy()
         out_template = str(task_dir / "%(title).100s.%(ext)s")
         is_audio = (quality == "mp3")
 
@@ -97,7 +127,7 @@ class PornhubDownloader:
                 "writethumbnail": True,
                 "quiet": True,
                 "no_warnings": True,
-                "http_headers": PornhubDownloader.HEADERS,
+                "http_headers": cls.HEADERS,
             }
         else:
             if quality == "best":
@@ -119,8 +149,11 @@ class PornhubDownloader:
                 "writethumbnail": True,
                 "quiet": True,
                 "no_warnings": True,
-                "http_headers": PornhubDownloader.HEADERS,
+                "http_headers": cls.HEADERS,
             }
+
+        if proxy:
+            ydl_opts["proxy"] = proxy
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:

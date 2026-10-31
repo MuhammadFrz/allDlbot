@@ -74,6 +74,13 @@ def deploy():
 
         sftp.close()
 
+        print_step("Ensuring system packages and services (Tor, PhantomJS)...")
+        sys_setup_cmd = (
+            "systemctl enable --now tor 2>/dev/null || (apt update -y && apt install -y tor && systemctl enable --now tor)"
+        )
+        stdin, stdout, stderr = client.exec_command(sys_setup_cmd)
+        stdout.channel.recv_exit_status()
+
         print_step("Installing Python requirements on VPS...")
         pip_cmd = (
             "pip3 install --break-system-packages -r /opt/alldlbot/requirements.txt"
