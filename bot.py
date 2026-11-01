@@ -19,7 +19,16 @@ from utils.cleanup import (
 )
 from utils.progress import TelegramProgress, human_bytes, create_bar
 from utils.detector import extract_url, detect_platform
-from utils.converter import video_to_mp3, video_to_gif, convert_video_quality, extract_thumbnail, convert_file_format, get_video_params
+from utils.converter import (
+    video_to_mp3,
+    video_to_gif,
+    convert_video_quality,
+    extract_thumbnail,
+    prepare_telegram_thumbnail,
+    convert_file_format,
+    get_video_params,
+    get_video_duration,
+)
 from downloaders import (
     YouTubeDownloader,
     InstagramDownloader,
@@ -74,18 +83,29 @@ def prepare_video_attributes(
     Prepare DocumentAttributeVideo/Animated and thumbnail path for Telethon send_file.
     Ensures video uploads display with correct duration, thumbnail preview, and dimensions.
     """
-    if not duration or not width or not height:
-        p_dur, p_w, p_h = get_video_params(video_path)
-        duration = duration or p_dur
-        width = width or p_w
-        height = height or p_h
-
     duration = int(duration or 0)
+    width = int(width or 0)
+    height = int(height or 0)
+
+    if duration <= 0 or width <= 0 or height <= 0:
+        p_dur, p_w, p_h = get_video_params(video_path)
+        if duration <= 0 and p_dur:
+            duration = int(p_dur)
+        if width <= 0 and p_w:
+            width = int(p_w)
+        if height <= 0 and p_h:
+            height = int(p_h)
+
+    if duration <= 0:
+        d = get_video_duration(video_path)
+        if d:
+            duration = int(d)
+
     width = int(width or 1280)
     height = int(height or 720)
 
-    if not thumb_path or not Path(thumb_path).exists():
-        thumb_path = extract_thumbnail(video_path)
+    # Process and optimize thumbnail strictly to Telegram specifications (max 320x320 JPEG)
+    final_thumb_path = prepare_telegram_thumbnail(thumb_path, video_path)
 
     attrs = []
     if is_gif:
@@ -109,7 +129,7 @@ def prepare_video_attributes(
             )
         )
 
-    final_thumb = str(thumb_path) if (thumb_path and Path(thumb_path).exists() and Path(thumb_path).stat().st_size > 0) else None
+    final_thumb = str(final_thumb_path) if (final_thumb_path and Path(final_thumb_path).exists() and Path(final_thumb_path).stat().st_size > 0) else None
     return attrs, final_thumb
 
 
@@ -1276,6 +1296,7 @@ async def run_twitter_job(event, url: str, task_id: str):
 
     try:
         async with active_semaphore:
+            task_dir.mkdir(parents=True, exist_ok=True)
             res = await TwitterDownloader.download(url, task_dir)
             if not res.get("success") or not res.get("media_items"):
                 await status_msg.edit(f"❌ **{res.get('error', 'No media found or download failed.')}**")
@@ -2206,8 +2227,12 @@ async def main():
     logger.info("Purging any previous leftover files in downloads...")
     purge_all_downloads()
 
-    # Start periodic background garbage collector (sweeps any abandoned files every 5 mins)
-    asyncio.create_task(periodic_cleaner_task())
+    # Start periodic background garbage collector (sweeps any abandoned files, preserving active tasks)
+    asyncio.create_task(
+        periodic_cleaner_task(
+            get_active_dirs=lambda: {j["task_dir"] for j in active_jobs.values() if j.get("task_dir")}
+        )
+    )
 
     logger.info("Starting All-In-One Media Downloader Telegram Bot...")
     await client.start(bot_token=config.TELEGRAM_BOT_TOKEN)

@@ -4,6 +4,7 @@ import shutil
 import uuid
 import asyncio
 from pathlib import Path
+from typing import Optional, Set
 from config import DOWNLOAD_DIR
 
 def create_task_dir(task_id: str = None) -> Path:
@@ -40,14 +41,18 @@ def purge_all_downloads():
             except Exception as e:
                 print(f"[Purge error] {e}")
 
-def purge_old_files(max_age_seconds: int = 1800):
-    """Remove any orphaned temporary folders or files older than max_age_seconds (default 30 mins)."""
+def purge_old_files(max_age_seconds: int = 1800, active_dirs: Optional[set] = None):
+    """Remove any orphaned temporary folders or files older than max_age_seconds (default 30 mins), skipping active task directories."""
     now = time.time()
     if not DOWNLOAD_DIR.exists():
         return
 
+    active_paths = {Path(p).resolve() for p in (active_dirs or set()) if p}
+
     for item in DOWNLOAD_DIR.iterdir():
         try:
+            if item.resolve() in active_paths:
+                continue
             mtime = item.stat().st_mtime
             if now - mtime > max_age_seconds:
                 if item.is_dir():
@@ -57,12 +62,13 @@ def purge_old_files(max_age_seconds: int = 1800):
         except Exception:
             pass
 
-async def periodic_cleaner_task():
+async def periodic_cleaner_task(get_active_dirs=None):
     """Background garbage collector that purges stale orphaned files every 10 minutes."""
     while True:
         try:
             await asyncio.sleep(600) # Every 10 minutes
-            purge_old_files(max_age_seconds=1800)
+            active_dirs = get_active_dirs() if get_active_dirs else None
+            purge_old_files(max_age_seconds=1800, active_dirs=active_dirs)
         except asyncio.CancelledError:
             break
         except Exception as e:

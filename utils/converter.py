@@ -113,6 +113,44 @@ def extract_thumbnail(video_path: Path, output_thumb: Optional[Path] = None, tim
 
     return output_thumb if output_thumb.exists() and output_thumb.stat().st_size > 200 else None
 
+def prepare_telegram_thumbnail(thumb_path: Optional[Path], video_path: Optional[Path] = None) -> Optional[Path]:
+    """
+    Ensure the thumbnail strictly adheres to Telegram's requirements:
+    1. Dimensions must not exceed 320x320.
+    2. Format must be standard JPEG (.jpg).
+    3. File size must be under 200KB.
+    If thumb_path doesn't exist or is invalid, attempts to extract a frame from video_path.
+    """
+    target_thumb = None
+
+    if thumb_path and Path(thumb_path).exists() and Path(thumb_path).stat().st_size > 100:
+        target_thumb = Path(thumb_path)
+
+    if not target_thumb and video_path and Path(video_path).exists():
+        extracted = extract_thumbnail(Path(video_path))
+        if extracted and extracted.exists() and extracted.stat().st_size > 100:
+            target_thumb = extracted
+
+    if not target_thumb:
+        return None
+
+    try:
+        from PIL import Image
+        with Image.open(target_thumb) as img:
+            img = img.convert("RGB")
+            # Downscale if width or height exceeds 320px
+            if img.width > 320 or img.height > 320:
+                img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            
+            opt_path = target_thumb.with_name(f"{target_thumb.stem}_tg.jpg")
+            img.save(opt_path, "JPEG", quality=85, optimize=True)
+            if opt_path.exists() and opt_path.stat().st_size > 100:
+                return opt_path
+    except Exception as e:
+        print(f"[prepare_telegram_thumbnail PIL error] {e}")
+
+    return target_thumb if target_thumb.exists() and target_thumb.stat().st_size > 100 else None
+
 def video_to_mp3(input_path: Path, output_path: Optional[Path] = None, bitrate: str = "320k") -> Optional[Path]:
     """Convert any video or audio file to MP3."""
     if output_path is None:

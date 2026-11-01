@@ -142,6 +142,7 @@ class TwitterDownloader:
                 if not raw_items:
                     continue
 
+                task_dir.mkdir(parents=True, exist_ok=True)
                 downloaded_items = []
                 for idx, item in enumerate(raw_items):
                     m_type = item["type"]
