@@ -7,8 +7,7 @@ import asyncio
 import requests
 import concurrent.futures
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
-import yt_dlp
+from typing import Dict, Any, Optional, Tuple, List, Callable
 
 from utils.cleanup import create_task_dir
 from utils.converter import get_video_params
@@ -20,11 +19,11 @@ class SxyprnDownloader:
 
     Features:
       1. Reverse-engineered decoder for sxyprn's client-side getvsrc() / data-vnfo video manifest.
-      2. Fast concurrent proxy discovery (ThreadPoolExecutor) to bypass US regional geo-blocks.
-      3. Resilient multi-proxy HTTP Range resumption chaining for large files (prevents truncated downloads).
+      2. Fast parallel proxy discovery with real CDN chunk pre-verification (prevents picking broken proxies).
+      3. Multi-proxy HTTP Range resumption chaining for large files (prevents truncated downloads).
       4. Exact byte-length verification against CDN Content-Range / Content-Length.
       5. FFprobe integrity check on output file.
-      6. yt-dlp fallback if direct extraction fails.
+      6. Real-time download progress callback reporting to Telegram.
     """
 
     HEADERS = {
@@ -62,12 +61,12 @@ class SxyprnDownloader:
         return arg
 
     @classmethod
-    def _get_proxy_candidates(cls) -> List[Optional[str]]:
+    def _get_proxy_candidates(cls) -> List[str]:
         now = time.time()
-        if cls._proxy_cache and (now - cls._proxy_cache_time) < 600:
+        if cls._proxy_cache and (now - cls._proxy_cache_time) < 300:
             return cls._proxy_cache
 
-        candidates: List[Optional[str]] = []
+        candidates: List[str] = []
 
         # 1. User-configured environment proxy
         env_proxy = os.getenv("SXYPRN_PROXY") or os.getenv("PORNHUB_PROXY")
@@ -100,9 +99,6 @@ class SxyprnDownloader:
         except Exception:
             pass
 
-        # 4. Direct connection fallback
-        candidates.append(None)
-
         cls._proxy_cache = candidates
         cls._proxy_cache_time = now
         return candidates
@@ -112,47 +108,49 @@ class SxyprnDownloader:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    async def download(url: str, task_dir: Optional[Path] = None) -> Dict[str, Any]:
+    async def download(
+        url: str,
+        task_dir: Optional[Path] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
         if task_dir is None:
             task_dir = create_task_dir()
 
-        # Engine 1: Native reverse-engineered decoder + resilient multi-proxy streaming
         try:
-            res = await asyncio.to_thread(SxyprnDownloader._scrape_and_download, url, task_dir)
+            res = await asyncio.to_thread(
+                SxyprnDownloader._scrape_and_download, url, task_dir, progress_callback
+            )
             if res.get("success") and res.get("path"):
                 return res
-        except Exception as e:
-            print(f"[sxyprn scrape error] {e}")
-
-        # Engine 2: yt-dlp fallback
-        try:
-            res = await asyncio.to_thread(SxyprnDownloader._ytdlp_download, url, task_dir)
-            if res.get("success") and res.get("path"):
+            elif res.get("error"):
                 return res
         except Exception as e:
-            print(f"[sxyprn yt-dlp error] {e}")
+            return {"success": False, "error": f"SXYPRN error: {e}"}
 
         return {
             "success": False,
-            "error": (
-                "Could not extract video from this sxyprn page. "
-                "The post may be private, deleted, or temporarily unavailable."
-            ),
+            "error": "Failed to extract and download video from this sxyprn page.",
         }
 
     # ------------------------------------------------------------------ #
-    # Stream Resolver via Candidate Proxy
+    # Fast Parallel Verified Stream Discovery
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _resolve_cdn_stream(cls, url: str, p_str: Optional[str]) -> Optional[Tuple[str, str, str]]:
-        p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"} if p_str else None
+    def _verify_proxy_stream(cls, url: str, p_str: str) -> Optional[Tuple[str, str, str, Optional[int]]]:
+        """
+        Tests candidate proxy through all 4 stages:
+          1. Page HTML fetch & data-vnfo check
+          2. Decoding manifest
+          3. 302 location check
+          4. 1KB Range GET request to verify the proxy can ACTUALLY stream video chunks over HTTPS.
+        """
+        p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"}
         try:
-            r_page = requests.get(url, headers=cls.HEADERS, proxies=p_dict, timeout=(2, 4))
+            r_page = requests.get(url, headers=cls.HEADERS, proxies=p_dict, timeout=(2, 3))
             if r_page.status_code != 200 or "data-vnfo" not in r_page.text:
                 return None
 
-            # Extract title
             m_title = re.search(r"<title[^>]*>([^<]+)</title>", r_page.text, re.I)
             title = "SXYPRN Video"
             if m_title:
@@ -182,69 +180,107 @@ class SxyprnDownloader:
                     final_url,
                     headers={**cls.HEADERS, "Referer": url},
                     proxies=p_dict,
-                    timeout=5,
+                    timeout=4,
                     allow_redirects=False,
                 )
                 cdn = r_redir.headers.get("Location")
-                if cdn:
-                    if cdn.startswith("//"):
-                        cdn = "https:" + cdn
-                    return (p_str or "direct", cdn, title)
+                if not cdn:
+                    continue
+                if cdn.startswith("//"):
+                    cdn = "https:" + cdn
+
+                # Step 4: Verify actual video streaming capability with 1KB Range request
+                r_test = requests.get(
+                    cdn,
+                    headers={**cls.HEADERS, "Range": "bytes=0-1023", "Referer": url},
+                    proxies=p_dict,
+                    timeout=4,
+                )
+                if r_test.status_code == 206 and len(r_test.content) == 1024:
+                    cr = r_test.headers.get("Content-Range", "")
+                    m_total = re.search(r"/(\d+)", cr)
+                    total_bytes = int(m_total.group(1)) if m_total else None
+                    return (p_str, cdn, title, total_bytes)
 
         except Exception:
             pass
 
         return None
 
+    @classmethod
+    def _find_verified_stream(cls, url: str, exclude_proxies: set) -> Optional[Tuple[str, str, str, Optional[int]]]:
+        candidates = [p for p in cls._get_proxy_candidates() if p not in exclude_proxies]
+        batch_size = 40
+        max_scan = min(len(candidates), 160)
+
+        for i in range(0, max_scan, batch_size):
+            batch = candidates[i : i + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
+                future_to_p = {ex.submit(cls._verify_proxy_stream, url, p): p for p in batch}
+                for f in concurrent.futures.as_completed(future_to_p):
+                    res = f.result()
+                    if res:
+                        # Cancel remaining futures in batch to release resources
+                        for other_f in future_to_p:
+                            if other_f != f:
+                                other_f.cancel()
+                        return res
+
+        return None
+
     # ------------------------------------------------------------------ #
-    # Engine 1: Native scraper and downloader
+    # Core Scraper and Downloader Engine
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _scrape_and_download(cls, url: str, task_dir: Path) -> Dict[str, Any]:
+    def _scrape_and_download(
+        cls,
+        url: str,
+        task_dir: Path,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
         task_dir.mkdir(parents=True, exist_ok=True)
         out_path = task_dir / "sxyprn_video.mp4"
-
-        proxy_candidates = cls._get_proxy_candidates()
 
         total_bytes: Optional[int] = None
         video_title: str = "SXYPRN Video"
         last_cdn_url: Optional[str] = None
-        completed: bool = False
+        used_proxies: set = set()
+        max_resumes = 6
+        attempts = 0
 
-        batch_size = 30
-        proxy_idx = 0
-        max_scan = min(len(proxy_candidates), 180)
-
-        while not completed and proxy_idx < max_scan:
-            batch = proxy_candidates[proxy_idx : proxy_idx + batch_size]
-            proxy_idx += batch_size
-
-            resolved_stream = None
-            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
-                future_to_proxy = {ex.submit(cls._resolve_cdn_stream, url, p): p for p in batch}
-                for f in concurrent.futures.as_completed(future_to_proxy):
-                    res = f.result()
-                    if res:
-                        resolved_stream = res
-                        break
-
-            if not resolved_stream:
-                continue
-
-            p_str, cdn_url, video_title = resolved_stream
-            last_cdn_url = cdn_url
-            p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"} if p_str != "direct" else None
-
-            # Stream chunks from this proxy
+        while attempts < max_resumes:
+            attempts += 1
             cur_sz = out_path.stat().st_size if out_path.exists() else 0
             if total_bytes and cur_sz >= total_bytes:
-                completed = True
                 break
 
+            # Find a verified working proxy that can stream
+            stream_info = cls._find_verified_stream(url, exclude_proxies=used_proxies)
+            if not stream_info:
+                if out_path.exists() and total_bytes and out_path.stat().st_size >= total_bytes:
+                    break
+                return {
+                    "success": False,
+                    "error": (
+                        "Could not connect to SXYPRN streaming servers. "
+                        "The post may be deleted, blocked, or unavailable."
+                    ),
+                }
+
+            p_str, cdn_url, title, verified_total = stream_info
+            used_proxies.add(p_str)
+            video_title = title
+            last_cdn_url = cdn_url
+            if total_bytes is None and verified_total:
+                total_bytes = verified_total
+
+            cur_sz = out_path.stat().st_size if out_path.exists() else 0
             dl_headers = {**cls.HEADERS, "Referer": url}
             if cur_sz > 0:
                 dl_headers["Range"] = f"bytes={cur_sz}-"
+
+            p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"}
 
             try:
                 with requests.get(
@@ -252,7 +288,7 @@ class SxyprnDownloader:
                     headers=dl_headers,
                     proxies=p_dict,
                     stream=True,
-                    timeout=(6, 25),
+                    timeout=(8, 45),
                 ) as resp:
                     if resp.status_code not in (200, 206):
                         continue
@@ -268,31 +304,40 @@ class SxyprnDownloader:
                             if cl and resp.status_code == 200:
                                 total_bytes = int(cl)
 
+                    last_progress_time = 0.0
                     with open(out_path, "ab" if cur_sz > 0 else "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=256 * 1024):
+                        for chunk in resp.iter_content(chunk_size=64 * 1024):
                             if chunk:
                                 f.write(chunk)
+                                cur_sz += len(chunk)
+                                now = time.time()
+                                if progress_callback and (now - last_progress_time) >= 2.5:
+                                    last_progress_time = now
+                                    try:
+                                        progress_callback(cur_sz, total_bytes or cur_sz)
+                                    except Exception:
+                                        pass
 
+                # Check if download finished
                 final_sz = out_path.stat().st_size if out_path.exists() else 0
                 if total_bytes and final_sz >= total_bytes:
-                    completed = True
                     break
 
             except Exception:
-                # Connection dropped or timed out; continue outer loop to resume remaining bytes
+                # Connection dropped or timed out; continue loop to resume via next verified proxy
                 continue
 
-        if not out_path.exists():
+        if not out_path.exists() or out_path.stat().st_size == 0:
             return {
                 "success": False,
-                "error": "Failed to decode and download video from sxyprn."
+                "error": "Failed to download video file from SXYPRN.",
             }
 
         final_size = out_path.stat().st_size
         if total_bytes and final_size < total_bytes:
             return {
                 "success": False,
-                "error": f"Incomplete video download: received {final_size/(1024*1024):.1f}MB of {total_bytes/(1024*1024):.1f}MB."
+                "error": f"Incomplete download: received {final_size/(1024*1024):.1f}MB of {total_bytes/(1024*1024):.1f}MB.",
             }
 
         # Verify video playability with ffprobe
@@ -306,34 +351,3 @@ class SxyprnDownloader:
             "title": video_title,
             "video_url": last_cdn_url,
         }
-
-    # ------------------------------------------------------------------ #
-    # Engine 2: yt-dlp fallback
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _ytdlp_download(url: str, task_dir: Path) -> Dict[str, Any]:
-        out_template = str(task_dir / "sxyprn_%(id)s.%(ext)s")
-        ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
-            "outtmpl": out_template,
-            "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-            "cachedir": False,
-            "no_cache_dir": True,
-            "nopart": True,
-            "http_headers": SxyprnDownloader.HEADERS,
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get("title", "SXYPRN Video") if info else "SXYPRN Video"
-
-                for f in sorted(task_dir.iterdir()):
-                    if f.is_file() and f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-                        return {"success": True, "path": f, "title": title}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-        return {"success": False, "error": "yt-dlp could not extract this video."}

@@ -644,7 +644,13 @@ async def run_sxyprn_job(event, url: str, task_id: str):
 
     try:
         async with active_semaphore:
-            res = await SxyprnDownloader.download(url, task_dir)
+            dl_progress = TelegramProgress(status_msg, action="Downloading SXYPRN video", buttons=make_cancel_button(task_id))
+            loop = asyncio.get_running_loop()
+
+            def sync_progress(cur, tot):
+                asyncio.run_coroutine_threadsafe(dl_progress.callback(cur, tot), loop)
+
+            res = await SxyprnDownloader.download(url, task_dir, progress_callback=sync_progress)
             if not res.get("success") or not res.get("path"):
                 await status_msg.edit(f"❌ **{res.get('error', 'Could not download this SXYPRN video.')}**")
                 return
