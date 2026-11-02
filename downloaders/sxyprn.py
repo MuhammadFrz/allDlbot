@@ -2,8 +2,10 @@ import os
 import re
 import json
 import base64
+import time
 import asyncio
 import requests
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import yt_dlp
@@ -18,9 +20,9 @@ class SxyprnDownloader:
 
     Features:
       1. Reverse-engineered decoder for sxyprn's client-side getvsrc() / data-vnfo video manifest.
-      2. Dynamic geo-block bypass for the manifest scraper (elite proxy rotation for US state blocks).
-      3. Direct high-speed CDN streaming (trafficdeposit.com CDN is unblocked) with HTTP Range resumption.
-      4. Exact byte-length verification (prevents truncated uploads).
+      2. Fast concurrent proxy discovery (ThreadPoolExecutor) to bypass US regional geo-blocks.
+      3. Resilient multi-proxy HTTP Range resumption chaining for large files (prevents truncated downloads).
+      4. Exact byte-length verification against CDN Content-Range / Content-Length.
       5. FFprobe integrity check on output file.
       6. yt-dlp fallback if direct extraction fails.
     """
@@ -34,6 +36,9 @@ class SxyprnDownloader:
         "Referer": "https://sxyprn.com/",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+    _proxy_cache: List[str] = []
+    _proxy_cache_time: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Reverse-engineered decoding primitives (from main2.js)
@@ -57,45 +62,49 @@ class SxyprnDownloader:
         return arg
 
     @classmethod
-    def _get_proxy_candidates(cls) -> List[Optional[Dict[str, str]]]:
-        candidates: List[Optional[Dict[str, str]]] = []
+    def _get_proxy_candidates(cls) -> List[Optional[str]]:
+        now = time.time()
+        if cls._proxy_cache and (now - cls._proxy_cache_time) < 600:
+            return cls._proxy_cache
+
+        candidates: List[Optional[str]] = []
 
         # 1. User-configured environment proxy
         env_proxy = os.getenv("SXYPRN_PROXY") or os.getenv("PORNHUB_PROXY")
         if env_proxy:
-            candidates.append({"http": env_proxy, "https": env_proxy})
+            candidates.append(env_proxy)
 
-        # 2. Dynamic elite proxies from low-latency countries
+        # 2. Monosans continuously checked live proxies
         try:
             r = requests.get(
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2000&anonymity=elite&country=us,ca,de,fr,gb,nl",
+                "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
                 timeout=4,
             )
-            for line in r.text.strip().split("\r\n"):
+            for line in r.text.splitlines():
                 line = line.strip()
-                if line and ":" in line:
-                    candidates.append({"http": f"http://{line}", "https": f"http://{line}"})
+                if line and ":" in line and line not in candidates:
+                    candidates.append(line)
         except Exception:
             pass
 
-        # 3. Dynamic generic elite proxies
+        # 3. Proxyscrape pool
         try:
             r2 = requests.get(
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2000&anonymity=elite",
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500",
                 timeout=4,
             )
-            for line in r2.text.strip().split("\r\n"):
+            for line in r2.text.splitlines():
                 line = line.strip()
-                if line and ":" in line:
-                    p_dict = {"http": f"http://{line}", "https": f"http://{line}"}
-                    if p_dict not in candidates:
-                        candidates.append(p_dict)
+                if line and ":" in line and line not in candidates:
+                    candidates.append(line)
         except Exception:
             pass
 
-        # 4. Direct connection (unrestricted regions)
+        # 4. Direct connection fallback
         candidates.append(None)
 
+        cls._proxy_cache = candidates
+        cls._proxy_cache_time = now
         return candidates
 
     # ------------------------------------------------------------------ #
@@ -107,7 +116,7 @@ class SxyprnDownloader:
         if task_dir is None:
             task_dir = create_task_dir()
 
-        # Engine 1: Native reverse-engineered decoder + resilient streaming
+        # Engine 1: Native reverse-engineered decoder + resilient multi-proxy streaming
         try:
             res = await asyncio.to_thread(SxyprnDownloader._scrape_and_download, url, task_dir)
             if res.get("success") and res.get("path"):
@@ -132,6 +141,62 @@ class SxyprnDownloader:
         }
 
     # ------------------------------------------------------------------ #
+    # Stream Resolver via Candidate Proxy
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _resolve_cdn_stream(cls, url: str, p_str: Optional[str]) -> Optional[Tuple[str, str, str]]:
+        p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"} if p_str else None
+        try:
+            r_page = requests.get(url, headers=cls.HEADERS, proxies=p_dict, timeout=(2, 4))
+            if r_page.status_code != 200 or "data-vnfo" not in r_page.text:
+                return None
+
+            # Extract title
+            m_title = re.search(r"<title[^>]*>([^<]+)</title>", r_page.text, re.I)
+            title = "SXYPRN Video"
+            if m_title:
+                t = m_title.group(1).strip()
+                for sfx in [
+                    " - SXYPRN", " | SXYPRN", " - sxyprn.com",
+                    " | sxyprn.com", " - SexyPorn", " | SexyPorn"
+                ]:
+                    t = t.replace(sfx, "").replace(sfx.lower(), "")
+                title = t.strip() or title
+
+            m_vnfo = re.search(r"data-vnfo='([^']+)'", r_page.text) or re.search(r'data-vnfo="([^"]+)"', r_page.text)
+            if not m_vnfo:
+                return None
+
+            vnfo_raw = m_vnfo.group(1).replace("&quot;", '"')
+            vnfo_data = json.loads(vnfo_raw)
+
+            for pid, src in vnfo_data.items():
+                tmp = src.split("/")
+                b_val = cls._boo(cls._ssut51(tmp[6]), cls._ssut51(tmp[7]), "sxyprn.com")
+                tmp[1] += "8/" + b_val
+                tmp = cls._preda(tmp)
+                final_url = "https://sxyprn.com" + "/".join(tmp)
+
+                r_redir = requests.get(
+                    final_url,
+                    headers={**cls.HEADERS, "Referer": url},
+                    proxies=p_dict,
+                    timeout=5,
+                    allow_redirects=False,
+                )
+                cdn = r_redir.headers.get("Location")
+                if cdn:
+                    if cdn.startswith("//"):
+                        cdn = "https:" + cdn
+                    return (p_str or "direct", cdn, title)
+
+        except Exception:
+            pass
+
+        return None
+
+    # ------------------------------------------------------------------ #
     # Engine 1: Native scraper and downloader
     # ------------------------------------------------------------------ #
 
@@ -142,116 +207,56 @@ class SxyprnDownloader:
 
         proxy_candidates = cls._get_proxy_candidates()
 
-        cdn_url: Optional[str] = None
-        title: str = "SXYPRN Video"
-        scraping_proxy: Optional[Dict[str, str]] = None
-
-        # Step 1: Scrape post HTML and obtain 302 CDN location
-        for p_dict in proxy_candidates:
-            try:
-                r = requests.get(url, headers=cls.HEADERS, proxies=p_dict, timeout=6)
-                if r.status_code != 200 or "data-vnfo" not in r.text:
-                    continue
-
-                html = r.text
-
-                # Extract title
-                m_title = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
-                if m_title:
-                    t = m_title.group(1).strip()
-                    for sfx in [
-                        " - SXYPRN", " | SXYPRN", " - sxyprn.com",
-                        " | sxyprn.com", " - SexyPorn", " | SexyPorn"
-                    ]:
-                        t = t.replace(sfx, "").replace(sfx.lower(), "")
-                    title = t.strip() or title
-
-                # Extract data-vnfo
-                m_vnfo = re.search(r"data-vnfo='([^']+)'", html)
-                if not m_vnfo:
-                    m_vnfo = re.search(r'data-vnfo="([^"]+)"', html)
-                if not m_vnfo:
-                    continue
-
-                vnfo_raw = m_vnfo.group(1).replace("&quot;", '"')
-                vnfo_data = json.loads(vnfo_raw)
-
-                # Decode video URL for candidate streams
-                for pid, src in vnfo_data.items():
-                    tmp = src.split("/")
-                    b_val = cls._boo(cls._ssut51(tmp[6]), cls._ssut51(tmp[7]), "sxyprn.com")
-                    tmp[1] += "8/" + b_val
-                    tmp = cls._preda(tmp)
-                    final_url = "https://sxyprn.com" + "/".join(tmp)
-
-                    # Fetch 302 redirect location
-                    r_redir = requests.get(
-                        final_url,
-                        headers=cls.HEADERS,
-                        proxies=p_dict,
-                        timeout=6,
-                        allow_redirects=False,
-                    )
-                    cdn = r_redir.headers.get("Location")
-                    if not cdn:
-                        continue
-
-                    if cdn.startswith("//"):
-                        cdn = "https:" + cdn
-
-                    cdn_url = cdn
-                    scraping_proxy = p_dict
-                    break
-
-                if cdn_url:
-                    break
-
-            except Exception:
-                continue
-
-        if not cdn_url:
-            return {
-                "success": False,
-                "error": "Failed to decode video source from sxyprn page."
-            }
-
-        # Step 2: Download video from CDN
-        # Direct VPS connection to CDN is fastest and doesn't drop.
-        # If direct fails, fall back to scraping proxy, then other candidates.
-        dl_proxies = [None]
-        if scraping_proxy and scraping_proxy not in dl_proxies:
-            dl_proxies.append(scraping_proxy)
-        for p in proxy_candidates:
-            if p and p not in dl_proxies:
-                dl_proxies.append(p)
-
         total_bytes: Optional[int] = None
+        video_title: str = "SXYPRN Video"
+        last_cdn_url: Optional[str] = None
+        completed: bool = False
 
-        for p_curr in dl_proxies:
-            retries = 0
-            while retries < 3:
-                cur_size = out_path.stat().st_size if out_path.exists() else 0
-                if total_bytes and cur_size >= total_bytes:
-                    break
+        batch_size = 30
+        proxy_idx = 0
+        max_scan = min(len(proxy_candidates), 180)
 
-                dl_headers = {**cls.HEADERS, "Referer": "https://sxyprn.com/"}
-                if cur_size > 0:
-                    dl_headers["Range"] = f"bytes={cur_size}-"
+        while not completed and proxy_idx < max_scan:
+            batch = proxy_candidates[proxy_idx : proxy_idx + batch_size]
+            proxy_idx += batch_size
 
-                try:
-                    resp = requests.get(
-                        cdn_url,
-                        headers=dl_headers,
-                        proxies=p_curr,
-                        stream=True,
-                        timeout=(10, 30),
-                    )
-
-                    if resp.status_code not in (200, 206):
-                        retries += 1
+            resolved_stream = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
+                future_to_proxy = {ex.submit(cls._resolve_cdn_stream, url, p): p for p in batch}
+                for f in concurrent.futures.as_completed(future_to_proxy):
+                    res = f.result()
+                    if res:
+                        resolved_stream = res
                         break
 
-                    # Parse total expected size
+            if not resolved_stream:
+                continue
+
+            p_str, cdn_url, video_title = resolved_stream
+            last_cdn_url = cdn_url
+            p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"} if p_str != "direct" else None
+
+            # Stream chunks from this proxy
+            cur_sz = out_path.stat().st_size if out_path.exists() else 0
+            if total_bytes and cur_sz >= total_bytes:
+                completed = True
+                break
+
+            dl_headers = {**cls.HEADERS, "Referer": url}
+            if cur_sz > 0:
+                dl_headers["Range"] = f"bytes={cur_sz}-"
+
+            try:
+                with requests.get(
+                    cdn_url,
+                    headers=dl_headers,
+                    proxies=p_dict,
+                    stream=True,
+                    timeout=(6, 25),
+                ) as resp:
+                    if resp.status_code not in (200, 206):
+                        continue
+
                     if total_bytes is None:
                         cr = resp.headers.get("Content-Range")
                         if cr:
@@ -263,28 +268,25 @@ class SxyprnDownloader:
                             if cl and resp.status_code == 200:
                                 total_bytes = int(cl)
 
-                    with open(out_path, "ab" if cur_size > 0 else "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=512 * 1024):
+                    with open(out_path, "ab" if cur_sz > 0 else "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=256 * 1024):
                             if chunk:
                                 f.write(chunk)
 
-                    new_size = out_path.stat().st_size if out_path.exists() else 0
-                    if total_bytes and new_size >= total_bytes:
-                        break
+                final_sz = out_path.stat().st_size if out_path.exists() else 0
+                if total_bytes and final_sz >= total_bytes:
+                    completed = True
+                    break
 
-                    retries += 1
+            except Exception:
+                # Connection dropped or timed out; continue outer loop to resume remaining bytes
+                continue
 
-                except Exception:
-                    retries += 1
-                    continue
-
-            final_cur = out_path.stat().st_size if out_path.exists() else 0
-            if total_bytes and final_cur >= total_bytes:
-                break
-
-        # Step 3: Validate output file
         if not out_path.exists():
-            return {"success": False, "error": "Downloaded video file does not exist."}
+            return {
+                "success": False,
+                "error": "Failed to decode and download video from sxyprn."
+            }
 
         final_size = out_path.stat().st_size
         if total_bytes and final_size < total_bytes:
@@ -301,8 +303,8 @@ class SxyprnDownloader:
         return {
             "success": True,
             "path": out_path,
-            "title": title,
-            "video_url": cdn_url,
+            "title": video_title,
+            "video_url": last_cdn_url,
         }
 
     # ------------------------------------------------------------------ #
