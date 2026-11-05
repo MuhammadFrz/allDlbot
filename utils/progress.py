@@ -1,6 +1,10 @@
 import time
 import math
+import logging
 from typing import Optional, Callable
+from telethon import errors
+
+logger = logging.getLogger(__name__)
 
 def human_bytes(size: float) -> str:
     """Format bytes to human readable format (KB, MB, GB)."""
@@ -28,14 +32,14 @@ class TelegramProgress:
         self.buttons = buttons
         self.start_time = time.time()
         self.last_update_time = 0
-        self.min_interval = 2.5 # Update every 2.5 seconds
+        self.min_interval = 4.5  # Safe 4.5s throttle to prevent Telegram FloodWait on EditMessageRequest
+        self._last_text = ""
 
     async def callback(self, current: int, total: int):
         now = time.time()
         if now - self.last_update_time < self.min_interval and current < total:
             return
 
-        self.last_update_time = now
         total = total or 1
         percent = min(100.0, (current / total) * 100)
         speed = current / (now - self.start_time + 0.001)
@@ -53,10 +57,22 @@ class TelegramProgress:
             f"📦 **Size:** `{cur_str} / {tot_str}`\n"
             f"⚡ **Speed:** `{spd_str}` | ⏳ **ETA:** `{eta_str}`"
         )
+        if text == self._last_text:
+            return
+
+        self.last_update_time = now
+        self._last_text = text
+
         try:
             if self.buttons is not None:
                 await self.message.edit(text, buttons=self.buttons)
             else:
                 await self.message.edit(text)
+        except errors.FloodWaitError as e:
+            logger.warning(f"Telegram FloodWait in progress update: back off for {e.seconds}s")
+            self.min_interval = max(self.min_interval, e.seconds + 2)
+            self.last_update_time = now + e.seconds
+        except errors.MessageNotModifiedError:
+            pass
         except Exception:
             pass

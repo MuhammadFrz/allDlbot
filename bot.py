@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, errors
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio, DocumentAttributeAnimated
 
 import config
@@ -210,8 +210,13 @@ async def start_handler(event):
         "• 🔞 **Pornhub**: HD Videos with quality selector (1080p, 720p, etc.) & MP3\n\n"
         "👇 **Tap a platform below to learn more, or paste your link directly:**"
     )
-    await event.respond(welcome_text, buttons=MAIN_KEYBOARD, parse_mode="md")
-    await event.respond("⚡ **Select a platform to explore features:**", buttons=PLATFORM_INLINE_BUTTONS)
+    try:
+        await event.respond(welcome_text, buttons=MAIN_KEYBOARD, parse_mode="md")
+        await event.respond("⚡ **Select a platform to explore features:**", buttons=PLATFORM_INLINE_BUTTONS)
+    except errors.FloodWaitError as e:
+        logger.warning(f"Telegram FloodWait on start_handler: {e.seconds}s required")
+    except Exception as e:
+        logger.error(f"Error in start_handler: {e}")
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^(📥 Download Media|download|دانلود)"))
@@ -429,30 +434,66 @@ async def cancel_job_callback(event):
             cleanup_dir(task_dir)
 
         active_jobs.pop(task_id, None)
-        await event.edit("❌ **Download cancelled.** Temporary files purged from server.")
+        try:
+            await event.answer("Download cancelled.", alert=False)
+            await event.edit("❌ **Download cancelled.** Temporary files purged from server.")
+        except errors.MessageNotModifiedError:
+            pass
+        except errors.FloodWaitError as e:
+            logger.warning(f"Telegram FloodWait on cancel_job: {e.seconds}s required")
+        except Exception as e:
+            logger.debug(f"Error editing message on cancel: {e}")
     else:
-        await event.edit("❌ **Task already finished or cancelled.**")
+        try:
+            # Answer query cleanly without editing message to avoid FloodWait
+            await event.answer("Task already finished or cancelled.", alert=False)
+        except Exception:
+            pass
 
 
 @client.on(events.CallbackQuery(pattern=r"^cancel_ph:(.+)$"))
 async def cancel_ph_callback(event):
     video_id = event.pattern_match.group(1).decode("utf-8")
     pending_ph_tasks.pop(video_id, None)
-    await event.edit("❌ **Operation cancelled.**")
+    try:
+        await event.answer("Cancelled", alert=False)
+        await event.edit("❌ **Operation cancelled.**")
+    except errors.MessageNotModifiedError:
+        pass
+    except errors.FloodWaitError as e:
+        logger.warning(f"Telegram FloodWait on cancel_ph: {e.seconds}s required")
+    except Exception as e:
+        logger.debug(f"Error editing message on cancel_ph: {e}")
 
 
 @client.on(events.CallbackQuery(pattern=r"^cancel:(.+)$"))
 async def cancel_menu_callback(event):
     video_id = event.pattern_match.group(1).decode("utf-8")
     pending_yt_tasks.pop(video_id, None)
-    await event.edit("❌ **Operation cancelled.**")
+    try:
+        await event.answer("Cancelled", alert=False)
+        await event.edit("❌ **Operation cancelled.**")
+    except errors.MessageNotModifiedError:
+        pass
+    except errors.FloodWaitError as e:
+        logger.warning(f"Telegram FloodWait on cancel_menu: {e.seconds}s required")
+    except Exception as e:
+        logger.debug(f"Error editing message on cancel_menu: {e}")
 
 
 @client.on(events.CallbackQuery(pattern=r"^cancel_menu$"))
 async def cancel_menu_general(event):
     waiting_rename_tasks.pop(event.chat_id, None)
     waiting_custom_ext_tasks.pop(event.chat_id, None)
-    await event.edit("❌ **Operation cancelled.**")
+    try:
+        await event.answer("Cancelled", alert=False)
+        await event.edit("❌ **Operation cancelled.**")
+    except errors.MessageNotModifiedError:
+        pass
+    except errors.FloodWaitError as e:
+        logger.warning(f"Telegram FloodWait on cancel_menu_general: {e.seconds}s required")
+    except Exception as e:
+        logger.debug(f"Error editing message on cancel_menu_general: {e}")
 
 
 @client.on(events.NewMessage)
