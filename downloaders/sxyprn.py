@@ -112,24 +112,29 @@ class SxyprnDownloader:
         url: str,
         task_dir: Optional[Path] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         if task_dir is None:
             task_dir = create_task_dir()
 
         try:
             res = await asyncio.to_thread(
-                SxyprnDownloader._scrape_and_download, url, task_dir, progress_callback
+                SxyprnDownloader._scrape_and_download,
+                url,
+                task_dir,
+                progress_callback,
+                status_callback,
             )
             if res.get("success") and res.get("path"):
                 return res
             elif res.get("error"):
                 return res
         except Exception as e:
-            return {"success": False, "error": f"SXYPRN error: {e}"}
+            return {"success": False, "error": f"Download error: {e}"}
 
         return {
             "success": False,
-            "error": "Failed to extract and download video from this sxyprn page.",
+            "error": "Failed to extract and download video from this page.",
         }
 
     # ------------------------------------------------------------------ #
@@ -152,7 +157,7 @@ class SxyprnDownloader:
                 return None
 
             m_title = re.search(r"<title[^>]*>([^<]+)</title>", r_page.text, re.I)
-            title = "SXYPRN Video"
+            title = "Video"
             if m_title:
                 t = m_title.group(1).strip()
                 for sfx in [
@@ -208,13 +213,23 @@ class SxyprnDownloader:
         return None
 
     @classmethod
-    def _find_verified_stream(cls, url: str, exclude_proxies: set) -> Optional[Tuple[str, str, str, Optional[int]]]:
+    def _find_verified_stream(
+        cls,
+        url: str,
+        exclude_proxies: set,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> Optional[Tuple[str, str, str, Optional[int]]]:
         candidates = [p for p in cls._get_proxy_candidates() if p not in exclude_proxies]
         batch_size = 40
         max_scan = min(len(candidates), 160)
 
         for i in range(0, max_scan, batch_size):
             batch = candidates[i : i + batch_size]
+            if status_callback and i > 0:
+                try:
+                    status_callback(f"🔍 Searching fast streaming servers (tested {i}/{max_scan})...")
+                except Exception:
+                    pass
             with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
                 future_to_p = {ex.submit(cls._verify_proxy_stream, url, p): p for p in batch}
                 for f in concurrent.futures.as_completed(future_to_p):
@@ -238,12 +253,13 @@ class SxyprnDownloader:
         url: str,
         task_dir: Path,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         task_dir.mkdir(parents=True, exist_ok=True)
         out_path = task_dir / "sxyprn_video.mp4"
 
         total_bytes: Optional[int] = None
-        video_title: str = "SXYPRN Video"
+        video_title: str = "Adult Video"
         last_cdn_url: Optional[str] = None
         used_proxies: set = set()
         max_resumes = 6
@@ -255,15 +271,27 @@ class SxyprnDownloader:
             if total_bytes and cur_sz >= total_bytes:
                 break
 
+            if status_callback and attempts == 1:
+                try:
+                    status_callback("🔍 Finding streaming servers...")
+                except Exception:
+                    pass
+            elif status_callback and attempts > 1:
+                try:
+                    from utils.progress import human_bytes
+                    status_callback(f"🔄 Resuming stream ({human_bytes(cur_sz)} / {human_bytes(total_bytes or 0)})...")
+                except Exception:
+                    pass
+
             # Find a verified working proxy that can stream
-            stream_info = cls._find_verified_stream(url, exclude_proxies=used_proxies)
+            stream_info = cls._find_verified_stream(url, exclude_proxies=used_proxies, status_callback=status_callback)
             if not stream_info:
                 if out_path.exists() and total_bytes and out_path.stat().st_size >= total_bytes:
                     break
                 return {
                     "success": False,
                     "error": (
-                        "Could not connect to SXYPRN streaming servers. "
+                        "Could not connect to streaming servers. "
                         "The post may be deleted, blocked, or unavailable."
                     ),
                 }
@@ -274,6 +302,14 @@ class SxyprnDownloader:
             last_cdn_url = cdn_url
             if total_bytes is None and verified_total:
                 total_bytes = verified_total
+
+            if status_callback:
+                try:
+                    from utils.progress import human_bytes
+                    size_label = f" ({human_bytes(total_bytes)})" if total_bytes else ""
+                    status_callback(f"⚡ Connected to stream{size_label}! Downloading video...")
+                except Exception:
+                    pass
 
             cur_sz = out_path.stat().st_size if out_path.exists() else 0
             dl_headers = {**cls.HEADERS, "Referer": url}
@@ -288,7 +324,7 @@ class SxyprnDownloader:
                     headers=dl_headers,
                     proxies=p_dict,
                     stream=True,
-                    timeout=(8, 45),
+                    timeout=(8, 25),
                 ) as resp:
                     if resp.status_code not in (200, 206):
                         continue
@@ -306,12 +342,12 @@ class SxyprnDownloader:
 
                     last_progress_time = 0.0
                     with open(out_path, "ab" if cur_sz > 0 else "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        for chunk in resp.iter_content(chunk_size=256 * 1024):
                             if chunk:
                                 f.write(chunk)
                                 cur_sz += len(chunk)
                                 now = time.time()
-                                if progress_callback and (now - last_progress_time) >= 2.5:
+                                if progress_callback and (now - last_progress_time) >= 3.0:
                                     last_progress_time = now
                                     try:
                                         progress_callback(cur_sz, total_bytes or cur_sz)
@@ -330,7 +366,7 @@ class SxyprnDownloader:
         if not out_path.exists() or out_path.stat().st_size == 0:
             return {
                 "success": False,
-                "error": "Failed to download video file from SXYPRN.",
+                "error": "Failed to download video file.",
             }
 
         final_size = out_path.stat().st_size

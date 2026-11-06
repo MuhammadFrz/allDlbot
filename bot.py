@@ -691,14 +691,38 @@ async def run_sxyprn_job(event, url: str, task_id: str):
             def sync_progress(cur, tot):
                 asyncio.run_coroutine_threadsafe(dl_progress.callback(cur, tot), loop)
 
-            res = await SxyprnDownloader.download(url, task_dir, progress_callback=sync_progress)
+            def sync_status(msg_text):
+                async def _update_status():
+                    try:
+                        await status_msg.edit(msg_text, buttons=make_cancel_button(task_id))
+                    except errors.MessageNotModifiedError:
+                        pass
+                    except errors.FloodWaitError:
+                        pass
+                    except Exception:
+                        pass
+                asyncio.run_coroutine_threadsafe(_update_status(), loop)
+
+            res = await SxyprnDownloader.download(
+                url,
+                task_dir,
+                progress_callback=sync_progress,
+                status_callback=sync_status,
+            )
             if not res.get("success") or not res.get("path"):
-                await status_msg.edit(f"❌ **{res.get('error', 'Could not download this SXYPRN video.')}**")
+                err = res.get('error', 'Could not download this SXYPRN video.')
+                try:
+                    await status_msg.edit(f"❌ **{err}**")
+                except Exception:
+                    try:
+                        await event.reply(f"❌ **{err}**")
+                    except Exception:
+                        pass
                 return
 
             vid_path = res["path"]
-            title = res.get("title", "SXYPRN Video")
-            caption = f"🔞 **SXYPRN**\n\n{title}".strip()
+            title = res.get("title", "Adult Video")
+            caption = f"🔞 **Adult Video**\n\n{title}".strip()
 
             attrs, thumb = prepare_video_attributes(vid_path)
             progress = TelegramProgress(status_msg, action="Uploading SXYPRN video", buttons=make_cancel_button(task_id))
@@ -712,13 +736,22 @@ async def run_sxyprn_job(event, url: str, task_id: str):
                 progress_callback=progress.callback,
             )
 
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
         logger.info(f"SXYPRN job {task_id} cancelled by user.")
     except Exception as e:
         logger.error(f"SXYPRN error: {e}")
-        await status_msg.edit(f"❌ **Error downloading SXYPRN video:** {str(e)}")
+        try:
+            await status_msg.edit(f"❌ **Error downloading SXYPRN video:** {str(e)}")
+        except Exception:
+            try:
+                await event.reply(f"❌ **Error downloading SXYPRN video:** {str(e)}")
+            except Exception:
+                pass
     finally:
         cleanup_dir(task_dir)
         active_jobs.pop(task_id, None)

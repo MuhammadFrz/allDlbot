@@ -70,8 +70,8 @@ class TelegramProgress:
                 await self.message.edit(text)
         except errors.FloodWaitError as e:
             logger.warning(f"Telegram FloodWait in progress update: back off for {e.seconds}s")
-            self.min_interval = max(self.min_interval, e.seconds + 2)
-            self.last_update_time = now + e.seconds
+            self.min_interval = min(max(self.min_interval, 5.0), 10.0)
+            self.last_update_time = now + min(e.seconds, 10)
         except errors.MessageNotModifiedError:
             pass
         except Exception:
