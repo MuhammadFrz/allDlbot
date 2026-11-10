@@ -1,16 +1,23 @@
 import os
 import re
 import json
-import base64
+import errno
 import time
+import queue
+import shutil
+import random
+import base64
 import asyncio
+import itertools
+import threading
 import requests
 import concurrent.futures
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List, Callable
 
-from utils.cleanup import create_task_dir
+from utils.cleanup import create_task_dir, purge_old_files
 from utils.converter import get_video_params
+from utils.progress import human_bytes
 
 
 class SxyprnDownloader:
@@ -18,12 +25,12 @@ class SxyprnDownloader:
     Downloader for sxyprn.com video pages.
 
     Features:
-      1. Reverse-engineered decoder for sxyprn's client-side getvsrc() / data-vnfo video manifest.
-      2. Fast parallel proxy discovery with real CDN chunk pre-verification (prevents picking broken proxies).
-      3. Multi-proxy HTTP Range resumption chaining for large files (prevents truncated downloads).
-      4. Exact byte-length verification against CDN Content-Range / Content-Length.
-      5. FFprobe integrity check on output file.
-      6. Real-time download progress callback reporting to Telegram.
+      1. Reverse-engineered decoder for client-side getvsrc() / data-vnfo video manifest.
+      2. Warm-session parallel proxy verification with 64KB throughput benchmarking.
+      3. High-speed multi-proxy parallel Range downloader (4MB verified chunks + tail hedging)
+         so slow or dropping public proxies no longer stall or fail mid-download.
+      4. Proactive server disk space validation and explicit ENOSPC handling.
+      5. Exact byte-length verification, FFprobe integrity validation, and cancellation support.
     """
 
     HEADERS = {
@@ -39,13 +46,18 @@ class SxyprnDownloader:
     _proxy_cache: List[str] = []
     _proxy_cache_time: float = 0.0
 
+    CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per chunk
+    NUM_WORKERS = 5
+    MAX_CHUNK_SECONDS = 18.0
+    MAX_VERIFY_CHUNK_SECONDS = 3.5
+
     # ------------------------------------------------------------------ #
     # Reverse-engineered decoding primitives (from main2.js)
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def _ssut51(arg: str) -> int:
-        return sum(int(c) for c in re.sub(r'[^0-9]', '', arg))
+        return sum(int(c) for c in re.sub(r"[^0-9]", "", arg))
 
     @staticmethod
     def _boo(ss: int, es: int, host: str = "sxyprn.com") -> str:
@@ -61,47 +73,45 @@ class SxyprnDownloader:
         return arg
 
     @classmethod
-    def _get_proxy_candidates(cls) -> List[str]:
+    def _get_proxy_candidates(cls, force_refresh: bool = False) -> List[str]:
         now = time.time()
-        if cls._proxy_cache and (now - cls._proxy_cache_time) < 300:
-            return cls._proxy_cache
+        if not force_refresh and cls._proxy_cache and (now - cls._proxy_cache_time) < 300:
+            # Return env proxy first if set, plus a shuffled view of free proxies to avoid hammering stale order
+            env_proxy = os.getenv("SXYPRN_PROXY") or os.getenv("PORNHUB_PROXY")
+            free = [p for p in cls._proxy_cache if p != env_proxy]
+            random.shuffle(free)
+            return ([env_proxy] if env_proxy else []) + free
 
         candidates: List[str] = []
+        seen = set()
 
-        # 1. User-configured environment proxy
         env_proxy = os.getenv("SXYPRN_PROXY") or os.getenv("PORNHUB_PROXY")
         if env_proxy:
             candidates.append(env_proxy)
+            seen.add(env_proxy)
 
-        # 2. Monosans continuously checked live proxies
-        try:
-            r = requests.get(
-                "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-                timeout=4,
-            )
-            for line in r.text.splitlines():
-                line = line.strip()
-                if line and ":" in line and line not in candidates:
-                    candidates.append(line)
-        except Exception:
-            pass
+        sources = [
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500",
+        ]
+        free_pool: List[str] = []
+        for src_url in sources:
+            try:
+                r = requests.get(src_url, timeout=4)
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line and ":" in line and line not in seen:
+                        seen.add(line)
+                        free_pool.append(line)
+            except Exception:
+                pass
 
-        # 3. Proxyscrape pool
-        try:
-            r2 = requests.get(
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500",
-                timeout=4,
-            )
-            for line in r2.text.splitlines():
-                line = line.strip()
-                if line and ":" in line and line not in candidates:
-                    candidates.append(line)
-        except Exception:
-            pass
-
-        cls._proxy_cache = candidates
+        cls._proxy_cache = ([env_proxy] if env_proxy else []) + free_pool
         cls._proxy_cache_time = now
-        return candidates
+
+        shuffled = list(free_pool)
+        random.shuffle(shuffled)
+        return ([env_proxy] if env_proxy else []) + shuffled
 
     # ------------------------------------------------------------------ #
     # Public entry-point
@@ -113,6 +123,7 @@ class SxyprnDownloader:
         task_dir: Optional[Path] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         if task_dir is None:
             task_dir = create_task_dir()
@@ -124,10 +135,11 @@ class SxyprnDownloader:
                 task_dir,
                 progress_callback,
                 status_callback,
+                cancel_event,
             )
             if res.get("success") and res.get("path"):
                 return res
-            elif res.get("error"):
+            if res.get("error"):
                 return res
         except Exception as e:
             return {"success": False, "error": f"Download error: {e}"}
@@ -138,53 +150,65 @@ class SxyprnDownloader:
         }
 
     # ------------------------------------------------------------------ #
-    # Fast Parallel Verified Stream Discovery
+    # Warm-Session Proxy Stream Verification
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _verify_proxy_stream(cls, url: str, p_str: str) -> Optional[Tuple[str, str, str, Optional[int]]]:
+    def _verify_proxy_session(
+        cls,
+        url: str,
+        p_str: str,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Tuple[float, str, str, str, Optional[int], requests.Session]]:
         """
-        Tests candidate proxy through all 4 stages:
-          1. Page HTML fetch & data-vnfo check
-          2. Decoding manifest
-          3. 302 location check
-          4. 1KB Range GET request to verify the proxy can ACTUALLY stream video chunks over HTTPS.
+        Verify a proxy over a single kept-alive Session and benchmark a 64KB Range read.
+        Keeping the Session alive avoids cold-reconnect ProxyErrors on initial download.
         """
+        if stop_check and stop_check():
+            return None
+
         p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"}
+        sess = requests.Session()
+        sess.proxies.update(p_dict)
+        sess.headers.update(cls.HEADERS)
+
         try:
-            r_page = requests.get(url, headers=cls.HEADERS, proxies=p_dict, timeout=(2, 3))
-            if r_page.status_code != 200 or "data-vnfo" not in r_page.text:
+            r_page = sess.get(url, timeout=(2.5, 4))
+            if (stop_check and stop_check()) or r_page.status_code != 200 or "data-vnfo" not in r_page.text:
+                sess.close()
                 return None
 
             m_title = re.search(r"<title[^>]*>([^<]+)</title>", r_page.text, re.I)
-            title = "Video"
+            title = "Adult Video"
             if m_title:
                 t = m_title.group(1).strip()
                 for sfx in [
                     " - SXYPRN", " | SXYPRN", " - sxyprn.com",
-                    " | sxyprn.com", " - SexyPorn", " | SexyPorn"
+                    " | sxyprn.com", " - SexyPorn", " | SexyPorn",
                 ]:
                     t = t.replace(sfx, "").replace(sfx.lower(), "")
                 title = t.strip() or title
 
-            m_vnfo = re.search(r"data-vnfo='([^']+)'", r_page.text) or re.search(r'data-vnfo="([^"]+)"', r_page.text)
+            m_vnfo = re.search(r"data-vnfo='([^']+)'", r_page.text) or re.search(
+                r'data-vnfo="([^"]+)"', r_page.text
+            )
             if not m_vnfo:
+                sess.close()
                 return None
 
-            vnfo_raw = m_vnfo.group(1).replace("&quot;", '"')
-            vnfo_data = json.loads(vnfo_raw)
-
-            for pid, src in vnfo_data.items():
+            vnfo_data = json.loads(m_vnfo.group(1).replace("&quot;", '"'))
+            for _, src in vnfo_data.items():
+                if stop_check and stop_check():
+                    break
                 tmp = src.split("/")
                 b_val = cls._boo(cls._ssut51(tmp[6]), cls._ssut51(tmp[7]), "sxyprn.com")
                 tmp[1] += "8/" + b_val
                 tmp = cls._preda(tmp)
                 final_url = "https://sxyprn.com" + "/".join(tmp)
 
-                r_redir = requests.get(
+                r_redir = sess.get(
                     final_url,
-                    headers={**cls.HEADERS, "Referer": url},
-                    proxies=p_dict,
+                    headers={"Referer": url},
                     timeout=4,
                     allow_redirects=False,
                 )
@@ -194,58 +218,40 @@ class SxyprnDownloader:
                 if cdn.startswith("//"):
                     cdn = "https:" + cdn
 
-                # Step 4: Verify actual video streaming capability with 1KB Range request
-                r_test = requests.get(
+                t_chunk = time.time()
+                r_test = sess.get(
                     cdn,
-                    headers={**cls.HEADERS, "Range": "bytes=0-1023", "Referer": url},
-                    proxies=p_dict,
-                    timeout=4,
+                    headers={"Range": "bytes=0-65535", "Referer": url},
+                    timeout=5,
                 )
-                if r_test.status_code == 206 and len(r_test.content) == 1024:
+                dt = time.time() - t_chunk
+                if (
+                    not (stop_check and stop_check())
+                    and r_test.status_code == 206
+                    and len(r_test.content) == 65536
+                    and dt <= cls.MAX_VERIFY_CHUNK_SECONDS
+                ):
                     cr = r_test.headers.get("Content-Range", "")
                     m_total = re.search(r"/(\d+)", cr)
                     total_bytes = int(m_total.group(1)) if m_total else None
-                    return (p_str, cdn, title, total_bytes)
-
+                    return (dt, p_str, cdn, title, total_bytes, sess)
         except Exception:
             pass
 
-        return None
-
-    @classmethod
-    def _find_verified_stream(
-        cls,
-        url: str,
-        exclude_proxies: set,
-        status_callback: Optional[Callable[[str], None]] = None,
-    ) -> Optional[Tuple[str, str, str, Optional[int]]]:
-        candidates = [p for p in cls._get_proxy_candidates() if p not in exclude_proxies]
-        batch_size = 40
-        max_scan = min(len(candidates), 160)
-
-        for i in range(0, max_scan, batch_size):
-            batch = candidates[i : i + batch_size]
-            if status_callback and i > 0:
-                try:
-                    status_callback(f"🔍 Searching fast streaming servers (tested {i}/{max_scan})...")
-                except Exception:
-                    pass
-            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
-                future_to_p = {ex.submit(cls._verify_proxy_stream, url, p): p for p in batch}
-                for f in concurrent.futures.as_completed(future_to_p):
-                    res = f.result()
-                    if res:
-                        # Cancel remaining futures in batch to release resources
-                        for other_f in future_to_p:
-                            if other_f != f:
-                                other_f.cancel()
-                        return res
-
+        sess.close()
         return None
 
     # ------------------------------------------------------------------ #
-    # Core Scraper and Downloader Engine
+    # Parallel Chunked & Resilient Sequential Engines
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _emit_status(cb: Optional[Callable[[str], None]], msg: str):
+        if cb:
+            try:
+                cb(msg)
+            except Exception:
+                pass
 
     @classmethod
     def _scrape_and_download(
@@ -254,80 +260,478 @@ class SxyprnDownloader:
         task_dir: Path,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         task_dir.mkdir(parents=True, exist_ok=True)
         out_path = task_dir / "sxyprn_video.mp4"
 
-        total_bytes: Optional[int] = None
-        video_title: str = "Adult Video"
-        last_cdn_url: Optional[str] = None
-        used_proxies: set = set()
-        max_resumes = 6
-        attempts = 0
+        def is_cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
 
-        while attempts < max_resumes:
-            attempts += 1
-            cur_sz = out_path.stat().st_size if out_path.exists() else 0
-            if total_bytes and cur_sz >= total_bytes:
+        cls._emit_status(status_callback, "🔍 Finding fast streaming servers...")
+
+        # PriorityQueue items: (dt, tie_seq, p_str, cdn, title, total_bytes, sess)
+        verified_pq: queue.PriorityQueue = queue.PriorityQueue()
+        seq_counter = itertools.count()
+        used_proxies = set()
+        used_lock = threading.Lock()
+        stop_event = threading.Event()
+        producer_exhausted = threading.Event()
+        need_proxies_event = threading.Event()
+        need_proxies_event.set()
+
+        def producer_loop():
+            try:
+                for refresh_round in range(2):
+                    candidates = cls._get_proxy_candidates(force_refresh=(refresh_round > 0))
+                    with used_lock:
+                        batch_list = [p for p in candidates if p not in used_proxies]
+                        for p in batch_list:
+                            used_proxies.add(p)
+
+                    batch_size = 40
+                    for i in range(0, len(batch_list), batch_size):
+                        if stop_event.is_set() or is_cancelled():
+                            return
+
+                        # Throttle discovery once we have plenty of verified proxies waiting
+                        while (
+                            not stop_event.is_set()
+                            and not is_cancelled()
+                            and verified_pq.qsize() >= 10
+                        ):
+                            need_proxies_event.wait(0.5)
+                            need_proxies_event.clear()
+
+                        if stop_event.is_set() or is_cancelled():
+                            return
+
+                        batch = batch_list[i : i + batch_size]
+                        ex = concurrent.futures.ThreadPoolExecutor(max_workers=batch_size)
+                        stop_fn = lambda: stop_event.is_set() or is_cancelled()
+                        futs = [ex.submit(cls._verify_proxy_session, url, p, stop_fn) for p in batch]
+                        try:
+                            for f in concurrent.futures.as_completed(futs):
+                                res = f.result()
+                                if res:
+                                    dt, p_str, cdn, title, tot, sess = res
+                                    if stop_event.is_set() or is_cancelled():
+                                        sess.close()
+                                    else:
+                                        verified_pq.put((dt, next(seq_counter), p_str, cdn, title, tot, sess))
+                                if stop_event.is_set() or is_cancelled():
+                                    break
+                        finally:
+                            ex.shutdown(wait=False, cancel_futures=True)
+            finally:
+                producer_exhausted.set()
+
+        producer_thread = threading.Thread(target=producer_loop, daemon=True)
+        producer_thread.start()
+
+        # Wait for the first verified stream
+        first_item = None
+        wait_deadline = time.time() + 45.0
+        while time.time() < wait_deadline:
+            if is_cancelled():
+                stop_event.set()
+                cls._drain_pq(verified_pq)
+                return {"success": False, "error": "Download cancelled."}
+            try:
+                first_item = verified_pq.get(timeout=0.5)
+                break
+            except queue.Empty:
+                if producer_exhausted.is_set():
+                    break
+
+        if not first_item:
+            stop_event.set()
+            cls._drain_pq(verified_pq)
+            return {
+                "success": False,
+                "error": (
+                    "Could not connect to streaming servers. "
+                    "The post may be deleted, blocked, or temporarily unavailable."
+                ),
+            }
+
+        _, _, first_proxy, first_cdn, video_title, total_bytes, first_sess = first_item
+
+        # Pre-check server disk space cleanly before writing anything
+        purge_old_files(max_age_seconds=300)
+        free_bytes = shutil.disk_usage(task_dir).free
+        needed_bytes = (total_bytes or 0) + (16 * 1024 * 1024)
+        if total_bytes and free_bytes < needed_bytes:
+            stop_event.set()
+            first_sess.close()
+            cls._drain_pq(verified_pq)
+            return {
+                "success": False,
+                "error": (
+                    f"Insufficient server disk space "
+                    f"({human_bytes(total_bytes)} needed, {human_bytes(free_bytes)} free)."
+                ),
+            }
+
+        size_label = f" ({human_bytes(total_bytes)})" if total_bytes else ""
+        cls._emit_status(status_callback, f"⚡ Connected to fast streams{size_label}! Downloading video...")
+
+        try:
+            if total_bytes and total_bytes >= cls.CHUNK_SIZE:
+                dl_res = cls._download_parallel(
+                    url=url,
+                    out_path=out_path,
+                    total_bytes=total_bytes,
+                    first_item=first_item,
+                    verified_pq=verified_pq,
+                    stop_event=stop_event,
+                    producer_exhausted=producer_exhausted,
+                    need_proxies_event=need_proxies_event,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                )
+            else:
+                dl_res = cls._download_sequential(
+                    url=url,
+                    out_path=out_path,
+                    total_bytes=total_bytes,
+                    first_item=first_item,
+                    verified_pq=verified_pq,
+                    stop_event=stop_event,
+                    producer_exhausted=producer_exhausted,
+                    need_proxies_event=need_proxies_event,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                )
+        finally:
+            stop_event.set()
+            need_proxies_event.set()
+            cls._drain_pq(verified_pq)
+
+        if not dl_res.get("success"):
+            return dl_res
+
+        if is_cancelled():
+            return {"success": False, "error": "Download cancelled."}
+
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            return {"success": False, "error": "Failed to download video file."}
+
+        final_size = out_path.stat().st_size
+        if total_bytes and final_size < total_bytes:
+            return {
+                "success": False,
+                "error": (
+                    f"Incomplete download: received {final_size/(1024*1024):.1f}MB "
+                    f"of {total_bytes/(1024*1024):.1f}MB."
+                ),
+            }
+
+        # Verify playability with ffprobe
+        dur, _, _ = get_video_params(out_path)
+        if dur <= 0:
+            return {"success": False, "error": "Downloaded file is corrupted or not a valid video."}
+
+        return {
+            "success": True,
+            "path": out_path,
+            "title": video_title,
+            "video_url": dl_res.get("last_cdn") or first_cdn,
+        }
+
+    @staticmethod
+    def _drain_pq(pq: queue.PriorityQueue):
+        while True:
+            try:
+                item = pq.get_nowait()
+                try:
+                    item[6].close()
+                except Exception:
+                    pass
+            except queue.Empty:
                 break
 
-            if status_callback and attempts == 1:
-                try:
-                    status_callback("🔍 Finding streaming servers...")
-                except Exception:
-                    pass
-            elif status_callback and attempts > 1:
-                try:
-                    from utils.progress import human_bytes
-                    status_callback(f"🔄 Resuming stream ({human_bytes(cur_sz)} / {human_bytes(total_bytes or 0)})...")
-                except Exception:
-                    pass
+    @classmethod
+    def _download_parallel(
+        cls,
+        url: str,
+        out_path: Path,
+        total_bytes: int,
+        first_item: tuple,
+        verified_pq: queue.PriorityQueue,
+        stop_event: threading.Event,
+        producer_exhausted: threading.Event,
+        need_proxies_event: threading.Event,
+        progress_callback: Optional[Callable[[int, int], None]],
+        cancel_event: Optional[threading.Event],
+    ) -> Dict[str, Any]:
+        with open(out_path, "wb") as f:
+            f.truncate(total_bytes)
 
-            # Find a verified working proxy that can stream
-            stream_info = cls._find_verified_stream(url, exclude_proxies=used_proxies, status_callback=status_callback)
-            if not stream_info:
-                if out_path.exists() and total_bytes and out_path.stat().st_size >= total_bytes:
+        chunk_q: queue.Queue = queue.Queue()
+        total_chunks = 0
+        for idx, start in enumerate(range(0, total_bytes, cls.CHUNK_SIZE)):
+            end = min(start + cls.CHUNK_SIZE - 1, total_bytes - 1)
+            chunk_q.put((idx, start, end, 0))
+            total_chunks += 1
+
+        state_lock = threading.Lock()
+        completed_chunks = set()
+        in_flight: Dict[int, Tuple[int, int, float]] = {}
+        hedged_cids = set()
+        written_bytes = 0
+        last_progress_time = 0.0
+        last_activity_time = time.time()
+        fatal_error: Optional[str] = None
+        last_cdn = first_item[3]
+        done_event = threading.Event()
+
+        def is_stopped() -> bool:
+            return stop_event.is_set() or (cancel_event is not None and cancel_event.is_set())
+
+        def worker(initial_item=None):
+            nonlocal written_bytes, last_progress_time, last_activity_time, fatal_error, last_cdn
+            proxy_item = initial_item
+            fails = 0
+
+            try:
+                while not is_stopped() and not done_event.is_set():
+                    if proxy_item is None:
+                        need_proxies_event.set()
+                        try:
+                            proxy_item = verified_pq.get(timeout=1.0)
+                            fails = 0
+                        except queue.Empty:
+                            with state_lock:
+                                if len(completed_chunks) >= total_chunks:
+                                    break
+                            if producer_exhausted.is_set():
+                                break
+                            continue
+
+                    _, _, p_str, cdn, _, _, sess = proxy_item
+                    is_hedged = False
+                    cid = -1
+                    start = end = retries = 0
+
+                    try:
+                        cid, start, end, retries = chunk_q.get_nowait()
+                        with state_lock:
+                            if cid in completed_chunks:
+                                continue
+                            in_flight[cid] = (start, end, time.time())
+                    except queue.Empty:
+                        with state_lock:
+                            if len(completed_chunks) >= total_chunks:
+                                break
+                            now = time.time()
+                            # Speculatively race any tail chunk stuck longer than 8 seconds
+                            for active_cid, (a_start, a_end, started_at) in in_flight.items():
+                                if (
+                                    active_cid not in completed_chunks
+                                    and active_cid not in hedged_cids
+                                    and (now - started_at) > 8.0
+                                ):
+                                    cid, start, end = active_cid, a_start, a_end
+                                    hedged_cids.add(cid)
+                                    is_hedged = True
+                                    break
+                        if not is_hedged:
+                            time.sleep(0.25)
+                            continue
+
+                    expected_len = end - start + 1
+                    chunk_ok = False
+                    try:
+                        chunk_t0 = time.time()
+                        with sess.get(
+                            cdn,
+                            headers={"Range": f"bytes={start}-{end}", "Referer": url},
+                            stream=True,
+                            timeout=(6, 15),
+                        ) as r:
+                            if r.status_code != 206:
+                                raise ValueError(f"Unexpected status {r.status_code}")
+
+                            buf = bytearray()
+                            for part in r.iter_content(chunk_size=128 * 1024):
+                                if is_stopped() or done_event.is_set():
+                                    break
+                                if part:
+                                    buf.extend(part)
+                                    if len(buf) > expected_len:
+                                        break
+                                if (time.time() - chunk_t0) > cls.MAX_CHUNK_SECONDS and len(buf) < expected_len:
+                                    raise TimeoutError("Chunk transfer exceeded speed threshold")
+
+                        if is_stopped() or done_event.is_set():
+                            break
+
+                        if len(buf) != expected_len:
+                            raise ValueError(f"Short chunk read: {len(buf)} != {expected_len}")
+
+                        with state_lock:
+                            if cid not in completed_chunks:
+                                try:
+                                    with open(out_path, "r+b") as f:
+                                        f.seek(start)
+                                        f.write(buf)
+                                except OSError as disk_err:
+                                    if disk_err.errno == errno.ENOSPC:
+                                        fatal_error = "Server ran out of disk space during download."
+                                    else:
+                                        fatal_error = f"Disk write error: {disk_err}"
+                                    stop_event.set()
+                                    done_event.set()
+                                    return
+
+                                completed_chunks.add(cid)
+                                written_bytes += expected_len
+                                last_cdn = cdn
+                                now = time.time()
+                                last_activity_time = now
+                                if progress_callback and (
+                                    (now - last_progress_time) >= 2.5 or written_bytes >= total_bytes
+                                ):
+                                    last_progress_time = now
+                                    try:
+                                        progress_callback(written_bytes, total_bytes)
+                                    except Exception:
+                                        pass
+                                if len(completed_chunks) >= total_chunks:
+                                    done_event.set()
+                            in_flight.pop(cid, None)
+                            hedged_cids.discard(cid)
+
+                        chunk_ok = True
+                        fails = 0
+                    except Exception:
+                        with state_lock:
+                            if not is_hedged:
+                                in_flight.pop(cid, None)
+                                if cid not in completed_chunks:
+                                    if retries + 1 <= 15:
+                                        chunk_q.put((cid, start, end, retries + 1))
+                                    else:
+                                        fatal_error = "Exceeded retry limit on video segment due to unstable streaming servers."
+                                        stop_event.set()
+                                        done_event.set()
+                            else:
+                                hedged_cids.discard(cid)
+
+                        if not chunk_ok and not is_stopped():
+                            fails += 1
+                            if fails >= 2:
+                                try:
+                                    sess.close()
+                                except Exception:
+                                    pass
+                                proxy_item = None
+                                need_proxies_event.set()
+            finally:
+                if proxy_item is not None:
+                    try:
+                        proxy_item[6].close()
+                    except Exception:
+                        pass
+
+        workers = []
+        for i in range(cls.NUM_WORKERS):
+            t = threading.Thread(target=worker, args=(first_item if i == 0 else None,), daemon=True)
+            t.start()
+            workers.append(t)
+
+        # Deadlock-free coordinator watchdog loop
+        while not done_event.wait(0.5):
+            if is_stopped():
+                stop_event.set()
+                break
+            with state_lock:
+                if len(completed_chunks) >= total_chunks:
+                    done_event.set()
                     break
-                return {
-                    "success": False,
-                    "error": (
-                        "Could not connect to streaming servers. "
-                        "The post may be deleted, blocked, or unavailable."
-                    ),
-                }
+                idle_secs = time.time() - last_activity_time
+            if not any(w.is_alive() for w in workers):
+                break
+            if idle_secs > 90.0:
+                fatal_error = "Download stalled: streaming proxies stopped responding."
+                stop_event.set()
+                break
 
-            p_str, cdn_url, title, verified_total = stream_info
-            used_proxies.add(p_str)
-            video_title = title
-            last_cdn_url = cdn_url
+        stop_event.set()
+        for w in workers:
+            w.join(timeout=2.0)
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {"success": False, "error": "Download cancelled."}
+        if fatal_error:
+            return {"success": False, "error": fatal_error}
+        return {"success": True, "last_cdn": last_cdn}
+
+    @classmethod
+    def _download_sequential(
+        cls,
+        url: str,
+        out_path: Path,
+        total_bytes: Optional[int],
+        first_item: tuple,
+        verified_pq: queue.PriorityQueue,
+        stop_event: threading.Event,
+        producer_exhausted: threading.Event,
+        need_proxies_event: threading.Event,
+        progress_callback: Optional[Callable[[int, int], None]],
+        cancel_event: Optional[threading.Event],
+    ) -> Dict[str, Any]:
+        """Fallback resumable single-stream downloader for small or unknown-length videos."""
+        proxy_item = first_item
+        attempts = 0
+        no_progress_attempts = 0
+        last_cdn = first_item[3]
+
+        while attempts < 20 and no_progress_attempts < 8:
+            if cancel_event is not None and cancel_event.is_set():
+                return {"success": False, "error": "Download cancelled."}
+
+            cur_sz = out_path.stat().st_size if out_path.exists() else 0
+            if total_bytes and cur_sz >= total_bytes:
+                return {"success": True, "last_cdn": last_cdn}
+
+            if proxy_item is None:
+                need_proxies_event.set()
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return {"success": False, "error": "Download cancelled."}
+                    try:
+                        proxy_item = verified_pq.get(timeout=1.0)
+                        break
+                    except queue.Empty:
+                        if producer_exhausted.is_set():
+                            return {
+                                "success": False,
+                                "error": "No more streaming servers available to finish download.",
+                            }
+
+            attempts += 1
+            _, _, _, cdn_url, _, verified_total, sess = proxy_item
+            last_cdn = cdn_url
             if total_bytes is None and verified_total:
                 total_bytes = verified_total
 
-            if status_callback:
-                try:
-                    from utils.progress import human_bytes
-                    size_label = f" ({human_bytes(total_bytes)})" if total_bytes else ""
-                    status_callback(f"⚡ Connected to stream{size_label}! Downloading video...")
-                except Exception:
-                    pass
-
-            cur_sz = out_path.stat().st_size if out_path.exists() else 0
-            dl_headers = {**cls.HEADERS, "Referer": url}
+            headers = {"Referer": url}
             if cur_sz > 0:
-                dl_headers["Range"] = f"bytes={cur_sz}-"
+                headers["Range"] = f"bytes={cur_sz}-"
 
-            p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"}
-
+            bytes_this_try = 0
             try:
-                with requests.get(
-                    cdn_url,
-                    headers=dl_headers,
-                    proxies=p_dict,
-                    stream=True,
-                    timeout=(8, 25),
-                ) as resp:
-                    if resp.status_code not in (200, 206):
-                        continue
+                with sess.get(cdn_url, headers=headers, stream=True, timeout=(8, 25)) as resp:
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if "text/html" in ctype:
+                        raise ValueError("Received HTML instead of video stream")
+
+                    if cur_sz > 0 and resp.status_code != 206:
+                        raise ValueError(f"Expected 206 for resume, got {resp.status_code}")
+                    if cur_sz == 0 and resp.status_code not in (200, 206):
+                        raise ValueError(f"Unexpected status {resp.status_code}")
 
                     if total_bytes is None:
                         cr = resp.headers.get("Content-Range")
@@ -335,16 +739,19 @@ class SxyprnDownloader:
                             m_cr = re.search(r"/(\d+)", cr)
                             if m_cr:
                                 total_bytes = int(m_cr.group(1))
-                        if total_bytes is None:
+                        if total_bytes is None and resp.status_code == 200:
                             cl = resp.headers.get("Content-Length")
-                            if cl and resp.status_code == 200:
+                            if cl:
                                 total_bytes = int(cl)
 
                     last_progress_time = 0.0
                     with open(out_path, "ab" if cur_sz > 0 else "wb") as f:
                         for chunk in resp.iter_content(chunk_size=256 * 1024):
+                            if cancel_event is not None and cancel_event.is_set():
+                                return {"success": False, "error": "Download cancelled."}
                             if chunk:
                                 f.write(chunk)
+                                bytes_this_try += len(chunk)
                                 cur_sz += len(chunk)
                                 now = time.time()
                                 if progress_callback and (now - last_progress_time) >= 3.0:
@@ -354,36 +761,25 @@ class SxyprnDownloader:
                                     except Exception:
                                         pass
 
-                # Check if download finished
                 final_sz = out_path.stat().st_size if out_path.exists() else 0
-                if total_bytes and final_sz >= total_bytes:
-                    break
+                if (total_bytes and final_sz >= total_bytes) or (total_bytes is None and final_sz > 0):
+                    return {"success": True, "last_cdn": last_cdn}
 
+            except OSError as disk_err:
+                if disk_err.errno == errno.ENOSPC:
+                    return {"success": False, "error": "Server ran out of disk space during download."}
             except Exception:
-                # Connection dropped or timed out; continue loop to resume via next verified proxy
-                continue
+                pass
+            finally:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+                proxy_item = None
 
-        if not out_path.exists() or out_path.stat().st_size == 0:
-            return {
-                "success": False,
-                "error": "Failed to download video file.",
-            }
+            if bytes_this_try == 0:
+                no_progress_attempts += 1
+            else:
+                no_progress_attempts = 0
 
-        final_size = out_path.stat().st_size
-        if total_bytes and final_size < total_bytes:
-            return {
-                "success": False,
-                "error": f"Incomplete download: received {final_size/(1024*1024):.1f}MB of {total_bytes/(1024*1024):.1f}MB.",
-            }
-
-        # Verify video playability with ffprobe
-        dur, w, h = get_video_params(out_path)
-        if dur <= 0:
-            return {"success": False, "error": "Downloaded file is corrupted or not a valid video."}
-
-        return {
-            "success": True,
-            "path": out_path,
-            "title": video_title,
-            "video_url": last_cdn_url,
-        }
+        return {"success": False, "error": "Failed to complete video stream after multiple resumes."}

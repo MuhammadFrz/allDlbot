@@ -3,6 +3,7 @@ import re
 import uuid
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -425,6 +426,10 @@ async def cancel_job_callback(event):
     job = active_jobs.get(task_id)
 
     if job:
+        cancel_ev = job.get("cancel_event")
+        if cancel_ev:
+            cancel_ev.set()
+
         async_task = job.get("task")
         if async_task and not async_task.done():
             async_task.cancel()
@@ -675,8 +680,10 @@ async def message_handler(event):
 # -------------------------------------------------------------
 async def run_sxyprn_job(event, url: str, task_id: str):
     task_dir = create_task_dir(task_id)
+    cancel_event = threading.Event()
     if task_id in active_jobs:
         active_jobs[task_id]["task_dir"] = task_dir
+        active_jobs[task_id]["cancel_event"] = cancel_event
 
     status_msg = await event.reply(
         "⏳ **Fetching SXYPRN video...**",
@@ -708,6 +715,7 @@ async def run_sxyprn_job(event, url: str, task_id: str):
                 task_dir,
                 progress_callback=sync_progress,
                 status_callback=sync_status,
+                cancel_event=cancel_event,
             )
             if not res.get("success") or not res.get("path"):
                 err = res.get('error', 'Could not download this SXYPRN video.')
@@ -742,6 +750,7 @@ async def run_sxyprn_job(event, url: str, task_id: str):
                 pass
 
     except asyncio.CancelledError:
+        cancel_event.set()
         logger.info(f"SXYPRN job {task_id} cancelled by user.")
     except Exception as e:
         logger.error(f"SXYPRN error: {e}")
@@ -753,6 +762,7 @@ async def run_sxyprn_job(event, url: str, task_id: str):
             except Exception:
                 pass
     finally:
+        cancel_event.set()
         cleanup_dir(task_dir)
         active_jobs.pop(task_id, None)
 
