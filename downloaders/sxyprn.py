@@ -358,9 +358,11 @@ class SxyprnDownloader:
         _, _, first_proxy, first_cdn, video_title, total_bytes, first_sess = first_item
 
         # Pre-check server disk space cleanly before writing anything
-        purge_old_files(max_age_seconds=300)
         free_bytes = shutil.disk_usage(task_dir).free
         needed_bytes = (total_bytes or 0) + (16 * 1024 * 1024)
+        if total_bytes and free_bytes < needed_bytes:
+            purge_old_files(max_age_seconds=1800)
+            free_bytes = shutil.disk_usage(task_dir).free
         if total_bytes and free_bytes < needed_bytes:
             stop_event.set()
             first_sess.close()
