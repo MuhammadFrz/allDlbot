@@ -9,4 +9,5 @@ mutagen>=1.47.0
 Pillow>=10.0.0
 paramiko>=3.4.0
 requests>=2.31.0
+PySocks>=1.7.1
 hachoir>=3.3.0

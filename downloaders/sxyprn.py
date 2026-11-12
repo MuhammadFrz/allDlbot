@@ -5,9 +5,11 @@ import errno
 import time
 import queue
 import shutil
+import socket
 import random
 import base64
 import asyncio
+import logging
 import itertools
 import threading
 import requests
@@ -18,6 +20,8 @@ from typing import Dict, Any, Optional, Tuple, List, Callable
 from utils.cleanup import create_task_dir, purge_old_files
 from utils.converter import get_video_params
 from utils.progress import human_bytes
+
+logger = logging.getLogger("AllDLBot")
 
 
 class SxyprnDownloader:
@@ -44,12 +48,19 @@ class SxyprnDownloader:
     }
 
     _proxy_cache: List[str] = []
+    _proxy_tier2_cache: List[str] = []
+    _proxy_tier3_cache: List[str] = []
     _proxy_cache_time: float = 0.0
+    _good_proxies: List[str] = []
+    _warm_proxies: List[str] = []
+    _cache_lock = threading.Lock()
+    _harvester_started: bool = False
+    _harvester_stop = threading.Event()
 
     CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per chunk
     NUM_WORKERS = 5
-    MAX_CHUNK_SECONDS = 18.0
-    MAX_VERIFY_CHUNK_SECONDS = 3.5
+    MAX_CHUNK_SECONDS = 26.0
+    MAX_VERIFY_CHUNK_SECONDS = 12.0
 
     # ------------------------------------------------------------------ #
     # Reverse-engineered decoding primitives (from main2.js)
@@ -72,46 +83,269 @@ class SxyprnDownloader:
         arg[5] = str(int(arg[5]) - (s6 + s7))
         return arg
 
+    @staticmethod
+    def _proxy_dict(p_str: str) -> Dict[str, str]:
+        uri = p_str if "://" in p_str else f"http://{p_str}"
+        return {"http": uri, "https": uri}
+
     @classmethod
-    def _get_proxy_candidates(cls, force_refresh: bool = False) -> List[str]:
-        now = time.time()
-        if not force_refresh and cls._proxy_cache and (now - cls._proxy_cache_time) < 300:
-            # Return env proxy first if set, plus a shuffled view of free proxies to avoid hammering stale order
-            env_proxy = os.getenv("SXYPRN_PROXY") or os.getenv("PORNHUB_PROXY")
-            free = [p for p in cls._proxy_cache if p != env_proxy]
-            random.shuffle(free)
-            return ([env_proxy] if env_proxy else []) + free
+    def _mark_good_proxy(cls, p_str: str) -> None:
+        if not p_str:
+            return
+        with cls._cache_lock:
+            if p_str in cls._good_proxies:
+                cls._good_proxies.remove(p_str)
+            cls._good_proxies.insert(0, p_str)
+            if len(cls._good_proxies) > 40:
+                del cls._good_proxies[40:]
+            if p_str in cls._warm_proxies:
+                cls._warm_proxies.remove(p_str)
+            cls._warm_proxies.insert(0, p_str)
+            if len(cls._warm_proxies) > 50:
+                del cls._warm_proxies[50:]
 
-        candidates: List[str] = []
-        seen = set()
+    @classmethod
+    def _unmark_good_proxy(cls, p_str: str) -> None:
+        if not p_str:
+            return
+        with cls._cache_lock:
+            if p_str in cls._good_proxies:
+                cls._good_proxies.remove(p_str)
 
+    @classmethod
+    def _get_hot_proxies(cls) -> List[str]:
         env_proxy = os.getenv("SXYPRN_PROXY") or os.getenv("PORNHUB_PROXY")
-        if env_proxy:
-            candidates.append(env_proxy)
-            seen.add(env_proxy)
+        with cls._cache_lock:
+            good = list(cls._good_proxies)
+            warm = list(cls._warm_proxies)
+        seen = set()
+        hot: List[str] = []
+        for p in ([env_proxy] if env_proxy else []) + good + warm:
+            if p and p not in seen:
+                seen.add(p)
+                hot.append(p)
+        return hot
 
-        sources = [
+    @classmethod
+    def _tcp_alive(cls, uri: str, timeout: float = 1.3) -> bool:
+        try:
+            hp = uri.split("://", 1)[1] if "://" in uri else uri
+            ip, port = hp.rsplit(":", 1)
+            s = socket.create_connection((ip, int(port)), timeout=timeout)
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _filter_tcp_alive(cls, uris: List[str], max_workers: int = 300, timeout: float = 1.3) -> List[str]:
+        if not uris:
+            return []
+        alive: List[str] = []
+        workers = min(max_workers, len(uris))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(cls._tcp_alive, u, timeout): u for u in uris}
+            for f in concurrent.futures.as_completed(futs):
+                try:
+                    if f.result():
+                        alive.append(futs[f])
+                except Exception:
+                    pass
+        return alive
+
+    @classmethod
+    def _check_homepage_access(cls, uri: str, timeout: Tuple[float, float] = (2.5, 4.5)) -> bool:
+        sess = requests.Session()
+        sess.proxies.update(cls._proxy_dict(uri))
+        sess.headers.update(cls.HEADERS)
+        try:
+            r = sess.get("https://sxyprn.com/", timeout=timeout)
+            if r.status_code == 200 and "post_text" in r.text and "not available in your region" not in r.text:
+                return True
+        except Exception:
+            pass
+        finally:
+            sess.close()
+        return False
+
+    @classmethod
+    def _fetch_proxy_pools(cls, force_refresh: bool = False) -> Tuple[List[str], List[str], List[str]]:
+        now = time.time()
+        with cls._cache_lock:
+            if not force_refresh and cls._proxy_cache and (now - cls._proxy_cache_time) < 300:
+                return list(cls._proxy_cache), list(cls._proxy_tier2_cache), list(cls._proxy_tier3_cache)
+
+        # Tier 1: Fast fresh HTTP proxy feeds (port 80 filtered out — reverse proxies break HTTPS CONNECT)
+        tier1_http = [
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500",
+            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2500",
+            "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
         ]
-        free_pool: List[str] = []
-        for src_url in sources:
+        # Tier 2: Large HTTP backup feeds (fetched only if needed; cached alongside Tier 1)
+        tier2_http = [
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+            "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+        ]
+        # Tier 3: SOCKS4 fallback feeds
+        tier3_socks4 = [
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=2500",
+        ]
+
+        ip_port_re = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})")
+
+        def fetch_source(scheme: str, src_url: str) -> List[str]:
+            found: List[str] = []
             try:
                 r = requests.get(src_url, timeout=4)
-                for line in r.text.splitlines():
-                    line = line.strip()
-                    if line and ":" in line and line not in seen:
-                        seen.add(line)
-                        free_pool.append(line)
+                if r.status_code == 200:
+                    for line in r.text.splitlines():
+                        m = ip_port_re.search(line)
+                        if not m:
+                            continue
+                        hp = m.group(1)
+                        if scheme == "http" and hp.endswith(":80"):
+                            continue
+                        found.append(f"{scheme}://{hp}")
             except Exception:
                 pass
+            return found
 
-        cls._proxy_cache = ([env_proxy] if env_proxy else []) + free_pool
-        cls._proxy_cache_time = now
+        specs = (
+            [("http", u) for u in tier1_http]
+            + [("http", u) for u in tier2_http]
+            + [("socks4", u) for u in tier3_socks4]
+        )
+        results_by_url: Dict[str, List[str]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as ex:
+            fut_map = {ex.submit(fetch_source, sch, u): u for sch, u in specs}
+            for fut in concurrent.futures.as_completed(fut_map):
+                results_by_url[fut_map[fut]] = fut.result()
 
-        shuffled = list(free_pool)
-        random.shuffle(shuffled)
-        return ([env_proxy] if env_proxy else []) + shuffled
+        seen = set()
+        t1: List[str] = []
+        for u in tier1_http:
+            for p in results_by_url.get(u, []):
+                if p not in seen:
+                    seen.add(p)
+                    t1.append(p)
+
+        t2: List[str] = []
+        for u in tier2_http:
+            for p in results_by_url.get(u, []):
+                if p not in seen:
+                    seen.add(p)
+                    t2.append(p)
+
+        t3: List[str] = []
+        for u in tier3_socks4:
+            for p in results_by_url.get(u, []):
+                if p not in seen:
+                    seen.add(p)
+                    t3.append(p)
+
+        with cls._cache_lock:
+            cls._proxy_cache = t1
+            cls._proxy_tier2_cache = t2
+            cls._proxy_tier3_cache = t3
+            cls._proxy_cache_time = now
+
+        return t1, t2, t3
+
+    @classmethod
+    def _get_proxy_candidates(cls, force_refresh: bool = False) -> List[str]:
+        hot = cls._get_hot_proxies()
+        seen = set(hot)
+        t1, t2, t3 = cls._fetch_proxy_pools(force_refresh=force_refresh)
+        ordered = list(hot)
+        for pool in (t1, t2, t3):
+            shuf = [p for p in pool if p not in seen]
+            random.shuffle(shuf)
+            ordered.extend(shuf)
+            seen.update(shuf)
+        return ordered
+
+    @classmethod
+    def refresh_warm_proxies(cls) -> int:
+        """Background pass to keep a warm RAM pool of unblocked sxyprn.com proxies ready."""
+        with cls._cache_lock:
+            existing = list(dict.fromkeys(cls._good_proxies + cls._warm_proxies))
+
+        surviving: List[str] = []
+        if existing:
+            ex_check = concurrent.futures.ThreadPoolExecutor(max_workers=min(30, len(existing)))
+            try:
+                futs = {ex_check.submit(cls._check_homepage_access, u, (2.5, 4.5)): u for u in existing}
+                done, _ = concurrent.futures.wait(futs.keys(), timeout=15.0)
+                for f in done:
+                    try:
+                        if f.result():
+                            surviving.append(futs[f])
+                    except Exception:
+                        pass
+            finally:
+                ex_check.shutdown(wait=False, cancel_futures=True)
+
+        with cls._cache_lock:
+            cls._warm_proxies = surviving[:50]
+            cls._good_proxies = [p for p in cls._good_proxies if p in surviving]
+
+        if len(surviving) >= 12:
+            return len(surviving)
+
+        t1, t2, _ = cls._fetch_proxy_pools(force_refresh=True)
+        already = set(surviving)
+        t1_shuf = [p for p in t1 if p not in already]
+        random.shuffle(t1_shuf)
+        candidates = t1_shuf
+        alive = cls._filter_tcp_alive(candidates, max_workers=300, timeout=1.3)
+
+        if len(alive) < 150 and t2:
+            t2_shuf = [p for p in t2 if p not in already]
+            random.shuffle(t2_shuf)
+            alive.extend(cls._filter_tcp_alive(t2_shuf[:500], max_workers=300, timeout=1.3))
+
+        found = list(surviving)
+        if alive:
+            ex_home = concurrent.futures.ThreadPoolExecutor(max_workers=min(100, len(alive)))
+            try:
+                futs = {ex_home.submit(cls._check_homepage_access, u, (2.5, 4.5)): u for u in alive}
+                done, _ = concurrent.futures.wait(futs.keys(), timeout=25.0)
+                for f in done:
+                    try:
+                        if f.result() and futs[f] not in already:
+                            already.add(futs[f])
+                            found.append(futs[f])
+                    except Exception:
+                        pass
+            finally:
+                ex_home.shutdown(wait=False, cancel_futures=True)
+
+        with cls._cache_lock:
+            merged = list(dict.fromkeys(cls._good_proxies + found + cls._warm_proxies))
+            cls._warm_proxies = merged[:50]
+
+        logger.info(f"SXYPRN warm proxy pool refreshed: {len(found)} live unblocked proxies")
+        return len(found)
+
+    @classmethod
+    def start_harvester(cls) -> None:
+        """Start daemon background thread that keeps _warm_proxies fresh while bot runs."""
+        with cls._cache_lock:
+            if cls._harvester_started:
+                return
+            cls._harvester_started = True
+
+        def _loop():
+            while not cls._harvester_stop.is_set():
+                try:
+                    cls.refresh_warm_proxies()
+                except Exception as e:
+                    logger.warning(f"SXYPRN harvester error: {e}")
+                # Refresh every 10 minutes
+                cls._harvester_stop.wait(600.0)
+
+        threading.Thread(target=_loop, name="sxyprn-proxy-harvester", daemon=True).start()
 
     # ------------------------------------------------------------------ #
     # Public entry-point
@@ -167,13 +401,13 @@ class SxyprnDownloader:
         if stop_check and stop_check():
             return None
 
-        p_dict = {"http": f"http://{p_str}", "https": f"http://{p_str}"}
+        p_dict = cls._proxy_dict(p_str)
         sess = requests.Session()
         sess.proxies.update(p_dict)
         sess.headers.update(cls.HEADERS)
 
         try:
-            r_page = sess.get(url, timeout=(2.5, 4))
+            r_page = sess.get(url, timeout=(3.0, 5.0))
             if (stop_check and stop_check()) or r_page.status_code != 200 or "data-vnfo" not in r_page.text:
                 sess.close()
                 return None
@@ -209,7 +443,7 @@ class SxyprnDownloader:
                 r_redir = sess.get(
                     final_url,
                     headers={"Referer": url},
-                    timeout=4,
+                    timeout=(3.0, 5.0),
                     allow_redirects=False,
                 )
                 cdn = r_redir.headers.get("Location")
@@ -222,19 +456,39 @@ class SxyprnDownloader:
                 r_test = sess.get(
                     cdn,
                     headers={"Range": "bytes=0-65535", "Referer": url},
-                    timeout=5,
+                    timeout=(4.0, 8.0),
+                    stream=True,
                 )
-                dt = time.time() - t_chunk
-                if (
-                    not (stop_check and stop_check())
-                    and r_test.status_code == 206
-                    and len(r_test.content) == 65536
-                    and dt <= cls.MAX_VERIFY_CHUNK_SECONDS
-                ):
+                try:
+                    if r_test.status_code != 206:
+                        continue
                     cr = r_test.headers.get("Content-Range", "")
                     m_total = re.search(r"/(\d+)", cr)
                     total_bytes = int(m_total.group(1)) if m_total else None
-                    return (dt, p_str, cdn, title, total_bytes, sess)
+                    expected_verify = min(65536, total_bytes) if total_bytes else 65536
+
+                    t_hdr = time.time()
+                    buf = bytearray()
+                    for part in r_test.iter_content(chunk_size=16384):
+                        if stop_check and stop_check():
+                            break
+                        if part:
+                            buf.extend(part)
+                        if len(buf) >= expected_verify or (time.time() - t_chunk) > cls.MAX_VERIFY_CHUNK_SECONDS:
+                            break
+                    dt = time.time() - t_chunk
+                    read_dt = time.time() - t_hdr
+                finally:
+                    r_test.close()
+
+                if (
+                    not (stop_check and stop_check())
+                    and len(buf) >= expected_verify
+                    and dt <= cls.MAX_VERIFY_CHUNK_SECONDS
+                ):
+                    cls._mark_good_proxy(p_str)
+                    score = read_dt + 0.15 * dt
+                    return (score, p_str, cdn, title, total_bytes, sess)
         except Exception:
             pass
 
@@ -282,47 +536,87 @@ class SxyprnDownloader:
 
         def producer_loop():
             try:
+                stop_fn = lambda: stop_event.is_set() or is_cancelled()
                 for refresh_round in range(2):
+                    if stop_fn():
+                        return
                     candidates = cls._get_proxy_candidates(force_refresh=(refresh_round > 0))
                     with used_lock:
                         batch_list = [p for p in candidates if p not in used_proxies]
                         for p in batch_list:
                             used_proxies.add(p)
 
-                    batch_size = 40
-                    for i in range(0, len(batch_list), batch_size):
-                        if stop_event.is_set() or is_cancelled():
-                            return
+                    if not batch_list:
+                        continue
 
-                        # Throttle discovery once we have plenty of verified proxies waiting
-                        while (
-                            not stop_event.is_set()
-                            and not is_cancelled()
-                            and verified_pq.qsize() >= 10
-                        ):
-                            need_proxies_event.wait(0.5)
-                            need_proxies_event.clear()
+                    hot_set = set(cls._get_hot_proxies())
+                    hot_batch = [p for p in batch_list if p in hot_set]
+                    cold_batch = [p for p in batch_list if p not in hot_set]
 
-                        if stop_event.is_set() or is_cancelled():
-                            return
+                    # Fast TCP pre-filter on cold candidates to avoid wasting worker threads on dead IPs
+                    alive_cold = cls._filter_tcp_alive(cold_batch[:400], max_workers=250, timeout=1.2)
+                    alive_cold_set = set(alive_cold)
+                    remaining_cold = [p for p in cold_batch if p not in alive_cold_set]
 
-                        batch = batch_list[i : i + batch_size]
-                        ex = concurrent.futures.ThreadPoolExecutor(max_workers=batch_size)
-                        stop_fn = lambda: stop_event.is_set() or is_cancelled()
-                        futs = [ex.submit(cls._verify_proxy_session, url, p, stop_fn) for p in batch]
-                        try:
-                            for f in concurrent.futures.as_completed(futs):
-                                res = f.result()
+                    ordered_candidates = hot_batch + alive_cold + remaining_cold
+
+                    max_workers = 64
+                    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+                    pending = set()
+                    cand_iter = iter(ordered_candidates)
+                    exhausted = False
+
+                    def fill_pool():
+                        nonlocal exhausted
+                        while len(pending) < max_workers and not exhausted and not stop_fn():
+                            if verified_pq.qsize() >= 10:
+                                break
+                            try:
+                                p = next(cand_iter)
+                            except StopIteration:
+                                exhausted = True
+                                break
+                            pending.add(ex.submit(cls._verify_proxy_session, url, p, stop_fn))
+
+                    try:
+                        while not stop_fn():
+                            while (
+                                not stop_fn()
+                                and verified_pq.qsize() >= 10
+                                and not pending
+                            ):
+                                need_proxies_event.wait(0.5)
+                                need_proxies_event.clear()
+
+                            if stop_fn():
+                                break
+
+                            fill_pool()
+                            if not pending:
+                                if exhausted:
+                                    break
+                                continue
+
+                            done, pending = concurrent.futures.wait(
+                                pending,
+                                timeout=0.5,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                            for f in done:
+                                try:
+                                    res = f.result()
+                                except Exception:
+                                    res = None
                                 if res:
                                     dt, p_str, cdn, title, tot, sess = res
-                                    if stop_event.is_set() or is_cancelled():
+                                    if stop_fn():
                                         sess.close()
                                     else:
                                         verified_pq.put((dt, next(seq_counter), p_str, cdn, title, tot, sess))
-                                if stop_event.is_set() or is_cancelled():
-                                    break
-                        finally:
-                            ex.shutdown(wait=False, cancel_futures=True)
+                    finally:
+                        for f in pending:
+                            f.cancel()
+                        ex.shutdown(wait=False, cancel_futures=True)
             finally:
                 producer_exhausted.set()
 
@@ -331,7 +625,7 @@ class SxyprnDownloader:
 
         # Wait for the first verified stream
         first_item = None
-        wait_deadline = time.time() + 45.0
+        wait_deadline = time.time() + 75.0
         while time.time() < wait_deadline:
             if is_cancelled():
                 stop_event.set()
@@ -624,6 +918,7 @@ class SxyprnDownloader:
                         if not chunk_ok and not is_stopped():
                             fails += 1
                             if fails >= 2:
+                                cls._unmark_good_proxy(p_str)
                                 try:
                                     sess.close()
                                 except Exception:

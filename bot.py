@@ -2323,6 +2323,7 @@ async def main():
             get_active_dirs=lambda: {j["task_dir"] for j in active_jobs.values() if j.get("task_dir")}
         )
     )
+    SxyprnDownloader.start_harvester()
 
     logger.info("Starting All-In-One Media Downloader Telegram Bot...")
     await client.start(bot_token=config.TELEGRAM_BOT_TOKEN)

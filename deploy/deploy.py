@@ -30,7 +30,18 @@ def deploy():
 
     try:
         print_step("Connecting to server via SSH...")
-        client.connect(VPS_IP, username=VPS_LOGIN, password=VPS_PASSWORD, timeout=15)
+        connected = False
+        for attempt in range(1, 4):
+            try:
+                client.connect(VPS_IP, username=VPS_LOGIN, password=VPS_PASSWORD, timeout=20, banner_timeout=30)
+                connected = True
+                break
+            except Exception as conn_err:
+                if attempt == 3:
+                    raise
+                print(f"  Attempt {attempt} connection issue ({conn_err}), retrying in 2s...")
+                time.sleep(2)
+
         if client.get_transport():
             client.get_transport().set_keepalive(10)
         print("Connected successfully!")
